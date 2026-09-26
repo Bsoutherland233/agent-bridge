@@ -26,6 +26,13 @@ CLIs without automatically applying their patches.
 The bridge runs on your computer. Claude and Codex consultations still go to
 their providers through your own accounts.
 
+An optional experimental [peer-round extension](docs/PEER-ROUNDS.md) adds
+human-approved, selected-context consultations with up to three other peers,
+plus a local Agent Room for review and recording. It reuses the existing
+Claude/Codex bridge and offers conditional Hermes and existing-Grok-Bot adapters.
+It is off unless separately started and configured; replies never trigger
+another round automatically.
+
 ## Why you might want this
 
 Claude and Codex can contribute different approaches to the same problem.
