@@ -48,6 +48,7 @@ stated as not covered.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -58,7 +59,7 @@ import sqlite3
 import stat
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -406,6 +407,38 @@ def receipt_dir(state_root: str) -> str:
 
 def receipt_path(state_root: str, repo: str, retained_by: str | None = None) -> str:
     return os.path.join(receipt_dir(state_root), receipt_name(repo, retained_by))
+
+
+#: Where the per-repository decision locks live, beside the receipts. A
+#: subdirectory, so ``list_receipts`` (which lists ``*.json`` here) never
+#: sees them.
+LOCK_DIR = "locks"
+#: Well inside the hook's own 10 s timeout, so a stuck holder produces this
+#: gate's fail-closed deny rather than a host timeout.
+DECISION_LOCK_TIMEOUT_SECONDS = 5.0
+
+
+@contextlib.contextmanager
+def decision_lock(state_root: str, repo: str) -> Iterator[None]:
+    """Serialise every write of one repository's routing receipts.
+
+    Held by the gate across resolve, decide and read (see
+    ``_judge_write``), and by the ``routing_decide`` tool around its write,
+    so no receipt for the repository changes while a decision is being made
+    and taken up. Keyed by the repository root, the same key the receipts
+    use, so any path inside the repository takes the same lock. A path that
+    is not in a repository takes none; ``record_decision`` refuses it anyway.
+    Raises ``TimeoutError`` (an ``OSError``) when the lock cannot be had,
+    which every caller already treats as fail-closed.
+    """
+    root = repo_key(repo) if isinstance(repo, str) and os.path.isabs(repo) else None
+    if root is None:
+        yield
+        return
+    stem = receipt_name(root)[:-len(".json")]
+    path = os.path.join(receipt_dir(state_root), LOCK_DIR, stem + ".lock")
+    with store.file_lock(path, timeout=DECISION_LOCK_TIMEOUT_SECONDS):
+        yield
 
 
 def is_another_clients_retain(receipt: dict[str, Any], client: str) -> bool:
@@ -1492,31 +1525,40 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
         return shared, False
 
     def written(outcome: Any, repo: str) -> dict[str, Any] | None:
-        """The receipt the decision just wrote, when the decider reports it.
-
-        Re-reading instead can select a different receipt than the decision
-        made: a concurrent write by the other client can put a retain back in
-        the shared slot between the two, and the re-read then lands on this
-        client's old, overtaken slot and allows the call, even though the
-        decision just made routed this client's work away.
-        """
+        """The receipt the decision just wrote, when the decider reports it."""
         receipt = getattr(outcome, "receipt", None)
         if not isinstance(receipt, dict) or receipt.get("repo") != repo_key(repo) \
                 or receipt.get("caller") != client:
             return None
         return receipt
 
-    governing: dict[str, dict[str, Any]] = {}
-    for repo in repos:
-        try:
+    def decide_under_lock(repo: str) -> tuple[dict[str, Any] | None, Decision | None]:
+        """Resolve again, decide if still needed, and take what was written,
+        all while holding the repository's decision lock.
+
+        The lock is what makes the result exact. Without it the gate decided,
+        then re-read, and every write another process could make in between
+        -- the other client's retain, a routed-away or manual receipt, this
+        client's own delayed decision -- was a different way for the re-read
+        to land on a receipt the decision had not made. Patching each ordering
+        found the next one. Every writer of a routing receipt now takes this
+        lock (``record_decision`` callers here and in ``routing_decide``), so
+        nothing is written between this call's resolve and its read.
+
+        Resolving again first is the double check: another process may have
+        made the decision while this one waited, and deciding twice would
+        only write a second audit line for the same answer.
+        """
+        nonlocal now
+        with decision_lock(state_root, repo):
+            # The wait for the lock can be long enough to matter: a decision
+            # another process made meanwhile carries capacity observed after
+            # the ``now`` this call started with, and judged against that
+            # older instant it read as overtaken and was made again.
+            now = float(clock())
             receipt, alongside = effective(repo)
-        except (OSError, ValueError) as exc:
-            return Decision("deny", "gate_state_unavailable",
-                            f"delegation-first gate: routing state could not be read "
-                            f"({type(exc).__name__}); nothing is implemented until it can", repos)
-        if receipt is None and decide is not None:
-            # No receipt yet: make the decision now rather than refusing and
-            # asking the agent to make it. This is the automatic part.
+            if receipt is not None:
+                return receipt, None
             try:
                 if alongside:
                     outcome = decide(repo, task_type, retained_alongside=True)
@@ -1529,31 +1571,33 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
                 # to every caller-visible field.
                 named = getattr(exc, "args", ()) and type(exc).__name__ == "AutoDecisionError"
                 detail = f"{type(exc).__name__}: {exc}" if named else type(exc).__name__
-                return Decision(
+                return None, Decision(
                     "deny", "gate_auto_decision_failed",
                     f"delegation-first gate: the routing decision for {repo} could not be "
                     f"created ({detail}); nothing is implemented until it can be", repos)
-            try:
-                receipt = written(outcome, repo)
-                if receipt is None:
-                    # A decider that does not report what it wrote (only a
-                    # test double does): resolve again, overtaken rules and all.
-                    receipt, _ = effective(repo)
-                else:
-                    # The decision just made governs unless the shared slot
-                    # now holds something that binds this client: a routed-away
-                    # or manual receipt, or one of its own, written by the
-                    # other client or process while this decision was in
-                    # flight. Only another client's retain yields to it.
-                    current = read_receipt(state_root, repo)
-                    if current is not None and current != receipt \
-                            and not is_another_clients_retain(current, client):
-                        receipt = current
-            except (OSError, ValueError) as exc:
-                return Decision("deny", "gate_state_unavailable",
-                                f"delegation-first gate: routing state could not be read "
-                                f"({type(exc).__name__}); nothing is implemented until it can",
-                                repos)
+            receipt = written(outcome, repo)
+            if receipt is None:
+                # A decider that does not report what it wrote (only a test
+                # double does): resolve again, overtaken rules and all.
+                receipt, _ = effective(repo)
+            return receipt, None
+
+    governing: dict[str, dict[str, Any]] = {}
+    for repo in repos:
+        try:
+            receipt, _ = effective(repo)
+            failure = None
+            if receipt is None and decide is not None:
+                # No receipt yet: make the decision now rather than refusing
+                # and asking the agent to make it. This is the automatic part.
+                receipt, failure = decide_under_lock(repo)
+        except (OSError, ValueError) as exc:
+            # TimeoutError (the decision lock) is an OSError: fail closed.
+            return Decision("deny", "gate_state_unavailable",
+                            f"delegation-first gate: routing state could not be read "
+                            f"({type(exc).__name__}); nothing is implemented until it can", repos)
+        if failure is not None:
+            return failure
         if receipt is None:
             return Decision(
                 "deny", "no_routing_receipt",

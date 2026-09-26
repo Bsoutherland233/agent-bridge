@@ -1875,27 +1875,99 @@ class ARetainIsNotAClaimOnTheRepository(AutoCase):
         decision = self.judge_in_process("codex", racing)
         self.assertEqual((decision.permission, decision.code), ("deny", "routed_elsewhere"))
 
-    def test_a_binding_shared_receipt_written_mid_decision_still_binds(self):
-        """The reverse interleaving (Codex's re-review): while codex's retain is
-        being decided beside claude's, a routed-away receipt naming claude
-        lands in the shared slot. It binds codex, so codex's fresh retain must
-        not win."""
+    def test_no_receipt_writer_can_enter_while_a_decision_is_in_flight(self):
+        """The lock, not an ordering patch, closes the post-decision races:
+        while the gate is deciding, nobody else can take the decision lock."""
+        from unittest import mock
+
         self.arrange({})
         self.hook("claude", self.repo)
         codex_decide = gate.automatic_decider("codex", str(self.state), str(self.db))
-        shared_path = Path(gate.receipt_path(str(self.state), str(self.repo)))
+        attempts = []
 
-        def racing(repo, task_type, **kwargs):
-            outcome = codex_decide(repo, task_type, **kwargs)
-            self.assertTrue(outcome.receipt.get("retained_alongside"))
-            routed = json.loads(shared_path.read_text(encoding="utf-8"))
-            routed.update(decision="peer", code="routed_peer_implementation",
-                          owner_route="claude", caller="codex")
-            shared_path.write_text(json.dumps(routed), encoding="utf-8")   # the interleaved write
-            return outcome
+        def deciding(repo, task_type, **kwargs):
+            try:
+                with gate.decision_lock(str(self.state), repo):
+                    attempts.append("entered")
+            except TimeoutError:
+                attempts.append("excluded")
+            return codex_decide(repo, task_type, **kwargs)
 
-        decision = self.judge_in_process("codex", racing)
-        self.assertEqual((decision.permission, decision.code), ("deny", "routed_elsewhere"))
+        with mock.patch.object(gate, "DECISION_LOCK_TIMEOUT_SECONDS", 0.2):
+            decision = self.judge_in_process("codex", deciding)
+        self.assertEqual(attempts, ["excluded"])
+        self.assertEqual(decision.permission, "allow")
+
+    def test_a_held_decision_lock_fails_closed(self):
+        from unittest import mock
+
+        self.arrange({})
+        self.hook("claude", self.repo)
+        with mock.patch.object(gate, "DECISION_LOCK_TIMEOUT_SECONDS", 0.2), \
+                gate.decision_lock(str(self.state), str(self.repo)):
+            decision = self.judge_in_process("codex")
+        self.assertEqual((decision.permission, decision.code),
+                         ("deny", "gate_state_unavailable"))
+        self.assertIsNone(self.own_receipt("codex"))
+
+    def test_a_decision_made_while_waiting_is_taken_not_repeated(self):
+        """The double check under the lock: another process decided first."""
+        import threading
+
+        from agent_bridge import store
+
+        self.arrange({})
+        self.hook("claude", self.repo)
+        codex_decide = gate.automatic_decider("codex", str(self.state), str(self.db))
+        held = threading.Event()
+        before = len(self.decisions())
+
+        def other_process():
+            # Holds the lock first and decides only after the gate below has
+            # made its unlocked read (a missing receipt costs the store's
+            # one-second atomic-read grace) and started waiting.
+            with gate.decision_lock(str(self.state), str(self.repo)):
+                held.set()
+                time.sleep(store.ATOMIC_READ_GRACE_SECONDS + 1.0)
+                codex_decide(str(self.repo), "implementation", retained_alongside=True)
+
+        thread = threading.Thread(target=other_process)
+        thread.start()
+        self.assertTrue(held.wait(10))
+        decision = self.judge_in_process("codex")
+        thread.join(10)
+        self.assertEqual(decision.permission, "allow")
+        self.assertEqual(len(self.decisions()), before + 1, "the gate decided a second time")
+
+    def test_routing_decide_takes_the_same_lock(self):
+        """The hand-made writer is serialised with the gate too."""
+        from unittest import mock
+
+        from agent_bridge.localq.intake import AutomaticIntake
+        from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
+        from agent_bridge.orchestration import mcp
+
+        class Idle:
+            def sample(self):
+                return ResourceSnapshot(0.0, "normal", "normal", True, 10_000, cpu_load_ratio=0.1)
+
+        self.observe("claude")
+        router = StageRouter(str(self.db))
+        registered = router.register("manual-item", "implementation", allowed_routes=["claude"])
+        owned = router.assign("manual-item", "implementation", owner_id="an-agent",
+                              lease_seconds=600, expected_revision=registered["revision"])
+        queue = LocalQueue(self.base / "queue", sampler=Idle(), backend=FakeBackend())
+        tools = mcp.build_tools("claude", router, queue, AutomaticIntake(queue),
+                                state_root=str(self.state))
+        args = {"item_id": "manual-item", "stage": "implementation", "owner_id": "an-agent",
+                "stage_revision": owned["revision"], "repo": str(self.repo),
+                "reason": "chosen by hand"}
+        with mock.patch.object(gate, "DECISION_LOCK_TIMEOUT_SECONDS", 0.2), \
+                gate.decision_lock(str(self.state), str(self.repo)):
+            refused = tools["routing_decide"]["handler"](args)
+        self.assertFalse(refused["ok"], refused)
+        self.assertIsNone(self.receipt_for(self.repo))
+        self.assertTrue(tools["routing_decide"]["handler"](args)["ok"])
 
     def test_a_decider_reporting_nothing_does_not_revive_an_overtaken_slot(self):
         self.arrange({})
