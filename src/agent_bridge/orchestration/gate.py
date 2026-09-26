@@ -48,6 +48,7 @@ stated as not covered.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -57,8 +58,9 @@ import shlex
 import sqlite3
 import stat
 import sys
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -385,16 +387,154 @@ def enclosing_repos(path: str) -> list[str]:
         current = parent
 
 
-def receipt_name(repo: str) -> str:
-    return hashlib.sha256(os.path.realpath(repo).encode("utf-8")).hexdigest()[:32] + ".json"
+def receipt_name(repo: str, retained_by: str | None = None) -> str:
+    """The receipt file for ``repo``: the shared one, or a client's own retain.
+
+    ``retained_by`` names the per-client slot described at
+    :func:`is_another_clients_retain`. It is a closed client name, never a
+    caller-supplied string, so it cannot steer the file name anywhere else.
+    """
+    stem = hashlib.sha256(os.path.realpath(repo).encode("utf-8")).hexdigest()[:32]
+    if retained_by is None:
+        return stem + ".json"
+    if retained_by not in CLIENTS:
+        raise RoutingError("caller_invalid")
+    return f"{stem}.retain-{retained_by}.json"
 
 
 def receipt_dir(state_root: str) -> str:
     return os.path.join(str(state_root), RECEIPT_DIR)
 
 
-def receipt_path(state_root: str, repo: str) -> str:
-    return os.path.join(receipt_dir(state_root), receipt_name(repo))
+def receipt_path(state_root: str, repo: str, retained_by: str | None = None) -> str:
+    return os.path.join(receipt_dir(state_root), receipt_name(repo, retained_by))
+
+
+#: Where the per-repository decision locks live, beside the receipts. A
+#: subdirectory, so ``list_receipts`` (which lists ``*.json`` here) never
+#: sees them.
+LOCK_DIR = "locks"
+#: The whole write judgment -- locks, reads, any decision and the stage
+#: check -- must finish inside the hook entry's own 10 s timeout, because a
+#: host reads a hook that produced no decision as a non-blocking error and
+#: runs the tool (REVIEW-HISTORY item 61): a gate killed for running long
+#: fails open. So the judgment has a deadline of its own, measured from when
+#: it starts, and denies rather than start more work once it has passed. The
+#: margin is for interpreter start-up and the presence write before it.
+JUDGMENT_BUDGET_SECONDS = 7.0
+#: The longest the judgment waits for the decision locks, shared across all
+#: of a call's enclosing repositories and never more than the judgment has
+#: left. A holder that keeps them longer produces this gate's fail-closed
+#: deny rather than a host timeout.
+DECISION_LOCK_TIMEOUT_SECONDS = 3.0
+#: The hard bound. ``JUDGMENT_BUDGET_SECONDS`` only decides whether to start
+#: more work; a decision already running (SQLite waits, a slow disk) can
+#: still overrun it. So the hook process also arms a watchdog that, if no
+#: decision has been written by this many seconds after the hook started,
+#: writes a deny itself and exits. Below the hook entry's 10 s timeout with
+#: room for interpreter start-up, so the host always reads a decision.
+HOOK_WATCHDOG_SECONDS = 8.0
+#: May only lower the watchdog (tests use it); a value that would raise it,
+#: or one that does not parse, is ignored.
+HOOK_WATCHDOG_ENV = "AGENT_BRIDGE_GATE_WATCHDOG_SECONDS"
+
+
+class _SingleDecision:
+    """Write exactly one hook decision to stdout, from whichever of the main
+    judgment and the watchdog gets there first."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._written = False
+
+    def emit(self, text: str) -> bool:
+        with self._lock:
+            if self._written:
+                return False
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            self._written = True
+            return True
+
+
+def _watchdog_seconds() -> float:
+    try:
+        requested = float(os.environ.get(HOOK_WATCHDOG_ENV, ""))
+    except ValueError:
+        return HOOK_WATCHDOG_SECONDS
+    if not math.isfinite(requested) or requested <= 0:
+        return HOOK_WATCHDOG_SECONDS
+    return min(requested, HOOK_WATCHDOG_SECONDS)
+
+
+def _arm_watchdog(out: _SingleDecision) -> threading.Timer:
+    deny = json.dumps(hook_output(Decision(
+        "deny", "gate_timeout",
+        "delegation-first gate: the routing judgment did not finish in time; it is denied "
+        "rather than left to the host's timeout, which would run the tool (retry the call)")),
+        sort_keys=True) + "\n"
+
+    def fire() -> None:
+        if out.emit(deny):
+            # The decision is on stdout. Exit now so nothing the stuck
+            # judgment does later can reach the host; the kernel releases the
+            # decision locks with the process.
+            os._exit(0)
+
+    timer = threading.Timer(_watchdog_seconds(), fire)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+@contextlib.contextmanager
+def decision_lock(state_root: str, repo: str, timeout: float | None = None) -> Iterator[None]:
+    """Serialise every write of one repository's routing receipts.
+
+    Held by the gate across resolve, decide and read (see
+    ``_judge_write``), and by the ``routing_decide`` tool around its write,
+    so no receipt for the repository changes while a decision is being made
+    and taken up. Keyed by the repository root, the same key the receipts
+    use, so any path inside the repository takes the same lock. A path that
+    is not in a repository takes none; ``record_decision`` refuses it anyway.
+    Raises ``TimeoutError`` (an ``OSError``) when the lock cannot be had,
+    which every caller already treats as fail-closed.
+    """
+    root = repo_key(repo) if isinstance(repo, str) and os.path.isabs(repo) else None
+    if root is None:
+        yield
+        return
+    stem = receipt_name(root)[:-len(".json")]
+    path = os.path.join(receipt_dir(state_root), LOCK_DIR, stem + ".lock")
+    wait = DECISION_LOCK_TIMEOUT_SECONDS if timeout is None else max(0.0, timeout)
+    with store.file_lock(path, timeout=wait):
+        yield
+
+
+def is_another_clients_retain(receipt: dict[str, Any], client: str) -> bool:
+    """Whether ``receipt`` is an automatic decision by *another* client to keep
+    its own work, which says nothing about who else may work in the repository.
+
+    A retain means "the caller keeps its work", not "this repository belongs
+    to the caller". Enforcing the shared receipt as if it were a claim denied
+    the second assistant ``routed_elsewhere`` in every repository the policy
+    retains -- unclassified, client-derived, or narrowed to a route neither
+    assistant can dispatch to -- for up to four hours. The second assistant
+    now gets its own retain decision, in its own slot, and the shared receipt
+    is left as it was: no rewrite, so the two clients do not take turns
+    overwriting one file on every call.
+
+    Deliberately narrow. A routed-away decision still binds everyone (it names
+    the route the work is owed to), and a hand-made receipt still binds
+    everyone (an operator chose it). Only an automatic, self-owned, retained
+    decision by a different caller qualifies.
+    """
+    return (bool(receipt.get("automatic"))
+            and receipt.get("decision") == "self"
+            and str(receipt.get("code", "")).startswith("retained_")
+            and receipt.get("caller") in CLIENTS
+            and receipt.get("caller") != client
+            and receipt.get("owner_route") == receipt.get("caller"))
 
 
 def route_decision(caller: str, owner_route: str) -> str:
@@ -411,8 +551,15 @@ def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any
                     considered: dict[str, Any] | None = None,
                     automatic: bool = False,
                     policy_fingerprint: str | None = None,
-                    capacity_fingerprint: str | None = None) -> dict[str, Any]:
+                    capacity_fingerprint: str | None = None,
+                    retained_alongside: bool = False) -> dict[str, Any]:
     """Write the receipt for an owned stage and return it.
+
+    ``retained_alongside`` writes an automatic retain to the caller's own slot
+    instead of the shared one, for a caller that arrived while another client's
+    automatic retain holds the shared slot (:func:`is_another_clients_retain`).
+    Only a retain may go there: a decision that routes work away always
+    replaces the shared receipt, because it binds everyone.
 
     ``stage_record`` is the router's current view of the stage, already
     checked by the caller for ownership at the expected revision; this
@@ -476,17 +623,28 @@ def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any
         receipt["policy_fingerprint"] = policy_fingerprint
     if capacity_fingerprint is not None:
         receipt["capacity_fingerprint"] = capacity_fingerprint
+    if retained_alongside:
+        if not automatic or receipt["decision"] != "self" \
+                or not str(code or "").startswith("retained_"):
+            raise RoutingError("retained_alongside_invalid")
+        receipt["retained_alongside"] = True
     # The audit line first: a receipt that exists is always accounted for,
     # while an audit line without a receipt is only a decision that failed
     # to take effect.
     store.append_ledger(os.path.join(receipt_dir(state_root), AUDIT_LEDGER),
                         {"event": "routing_decided", **receipt})
-    store.atomic_write_json(receipt_path(state_root, repo_root), receipt)
+    store.atomic_write_json(
+        receipt_path(state_root, repo_root, caller if retained_alongside else None), receipt)
     return receipt
 
 
-def read_receipt(state_root: str, repo: str) -> dict[str, Any] | None:
+def read_receipt(state_root: str, repo: str,
+                 retained_by: str | None = None, *, grace: bool = True) -> dict[str, Any] | None:
     """The receipt for ``repo`` or None; ValueError for one that is not a receipt.
+
+    ``retained_by`` reads that client's own retain slot rather than the shared
+    receipt. A document there must be exactly what ``record_decision`` puts
+    there -- that client's automatic retain -- or it is not a receipt.
 
     Reads through ``store.read_json_atomic`` rather than an ``os.path.exists``
     check followed by a separate open. ``atomic_write_json`` replaces this
@@ -499,11 +657,30 @@ def read_receipt(state_root: str, repo: str) -> dict[str, Any] | None:
     rather than letting an in-flight replace look like a caller-visible crash.
     A corrupt document still fails immediately: only ``OSError`` is retried.
     """
-    path = receipt_path(state_root, repo)
+    path = receipt_path(state_root, repo, retained_by)
     try:
-        loaded = store.read_json_atomic(path)
-    except OSError:
+        # ``grace=False`` is for a reader that holds the repository's
+        # decision lock: every writer holds it too, so no replace can be in
+        # flight and a missing file is genuinely absent. Skipping the retry
+        # window there saves a second per missing receipt, which the hook's
+        # time budget needs (see ``JUDGMENT_BUDGET_SECONDS``).
+        loaded = store.read_json_atomic(path) if grace else store.read_json(path)
+    except FileNotFoundError:
         return None
+    # Any other OSError (a permission refusal or I/O error that outlasted the
+    # retry window) propagates. Read as "no receipt", it let the automatic
+    # decision replace a receipt nobody could read and then allow the call,
+    # which is fail-open. The gate turns it into gate_state_unavailable.
+    if retained_by is not None and not (
+            isinstance(loaded, dict) and loaded.get("retained_alongside") is True
+            and loaded.get("automatic") is True and loaded.get("caller") == retained_by
+            and loaded.get("owner_route") == retained_by and loaded.get("decision") == "self"
+            and str(loaded.get("code", "")).startswith("retained_")):
+        raise ValueError("routing receipt is not one this gate wrote")
+    if retained_by is None and isinstance(loaded, dict) and "retained_alongside" in loaded:
+        # A per-client retain copied into the shared slot would bind the other
+        # client again, which is the defect the slot exists to remove.
+        raise ValueError("routing receipt is not one this gate wrote")
     valid_until = loaded.get("valid_until") if isinstance(loaded, dict) else None
     if not isinstance(loaded, dict) or loaded.get("version") != RECEIPT_VERSION \
             or not isinstance(valid_until, (int, float)) or isinstance(valid_until, bool) \
@@ -1393,86 +1570,168 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
     if not repos:
         return Decision("allow", "outside_repository",
                         "no repository holds the target; the gate covers repositories")
+    budget_ends = time.monotonic() + JUDGMENT_BUDGET_SECONDS
     now = float(clock())
-    for repo in repos:
+    task_type = infer_task_type(paths)
+
+    def out_of_time() -> Decision:
+        return Decision("deny", "gate_state_unavailable",
+                        "delegation-first gate: the routing judgment ran out of its time budget "
+                        "before the hook's own timeout; nothing is implemented until it can "
+                        "finish (retry the call)", repos)
+
+    def overtaken(candidate: dict[str, Any]) -> bool:
+        return receipt_overtaken(
+            candidate, now, capacity_db, task_type,
+            lambda: autoroute.policy_fingerprint(state_root),
+            None if capacity_db is None else lambda: capacity_digest(capacity_db, now))
+
+    def effective(repo: str) -> tuple[dict[str, Any] | None, bool]:
+        """The receipt that governs this client here, and whether it lives in
+        this client's own retain slot."""
+        shared = read_receipt(state_root, repo, grace=False)
+        if shared is not None and decide is not None and is_another_clients_retain(shared, client):
+            # Another client kept its own work. That is not a claim on the
+            # repository, so this client is governed by its own retain, made
+            # and re-made exactly like a shared one but never overwriting
+            # theirs. Checked before the overtaken rules on purpose: whether
+            # their retain is stale is theirs to find out. Judged here, a
+            # different task type made each client re-decide the other's
+            # receipt, and the two took turns replacing it.
+            own = read_receipt(state_root, repo, client, grace=False)
+            if own is not None and overtaken(own):
+                own = None
+            return own, True
+        if shared is not None and decide is not None and overtaken(shared):
+            shared = None
+        return shared, False
+
+    def written(outcome: Any, repo: str) -> dict[str, Any] | None:
+        """The receipt the decision just wrote, when the decider reports it."""
+        receipt = getattr(outcome, "receipt", None)
+        if not isinstance(receipt, dict) or receipt.get("repo") != repo_key(repo) \
+                or receipt.get("caller") != client:
+            return None
+        return receipt
+
+    def decide_now(repo: str, alongside: bool) -> tuple[dict[str, Any] | None, Decision | None]:
+        """Make the missing decision and take up exactly what it wrote."""
         try:
-            receipt = read_receipt(state_root, repo)
-        except (OSError, ValueError) as exc:
-            return Decision("deny", "gate_state_unavailable",
-                            f"delegation-first gate: routing state could not be read "
-                            f"({type(exc).__name__}); nothing is implemented until it can", repos)
-        task_type = infer_task_type(paths)
-        if receipt is not None and decide is not None and receipt_overtaken(
-                receipt, now, capacity_db, task_type,
-                lambda: autoroute.policy_fingerprint(state_root),
-                None if capacity_db is None
-                else lambda: capacity_digest(capacity_db, now)):
-            receipt = None
-        if receipt is None and decide is not None:
-            # No receipt yet: make the decision now rather than refusing and
-            # asking the agent to make it. This is the automatic part.
+            if alongside:
+                outcome = decide(repo, task_type, retained_alongside=True)
+            else:
+                outcome = decide(repo, task_type)
+        except Exception as exc:  # noqa: BLE001  fail closed, name the class
+            # AutoDecisionError carries a fixed reason code this codebase
+            # wrote, so it is safe to repeat. Any other class's text is
+            # unvetted and is left out, the same rule ``errors.py`` applies
+            # to every caller-visible field.
+            named = getattr(exc, "args", ()) and type(exc).__name__ == "AutoDecisionError"
+            detail = f"{type(exc).__name__}: {exc}" if named else type(exc).__name__
+            return None, Decision(
+                "deny", "gate_auto_decision_failed",
+                f"delegation-first gate: the routing decision for {repo} could not be "
+                f"created ({detail}); nothing is implemented until it can be", repos)
+        receipt = written(outcome, repo)
+        if receipt is None:
+            # A decider that does not report what it wrote (only a test
+            # double does): resolve again, overtaken rules and all.
+            receipt, _ = effective(repo)
+        return receipt, None
+
+    def judge_held() -> Decision:
+        governing: dict[str, dict[str, Any]] = {}
+        for repo in repos:
+            if time.monotonic() >= budget_ends:
+                return out_of_time()
             try:
-                decide(repo, task_type)
-            except Exception as exc:  # noqa: BLE001  fail closed, name the class
-                # AutoDecisionError carries a fixed reason code this codebase
-                # wrote, so it is safe to repeat. Any other class's text is
-                # unvetted and is left out, the same rule ``errors.py`` applies
-                # to every caller-visible field.
-                named = getattr(exc, "args", ()) and type(exc).__name__ == "AutoDecisionError"
-                detail = f"{type(exc).__name__}: {exc}" if named else type(exc).__name__
-                return Decision(
-                    "deny", "gate_auto_decision_failed",
-                    f"delegation-first gate: the routing decision for {repo} could not be "
-                    f"created ({detail}); nothing is implemented until it can be", repos)
-            try:
-                receipt = read_receipt(state_root, repo)
+                receipt, alongside = effective(repo)
+                if receipt is None and decide is not None:
+                    if time.monotonic() >= budget_ends:
+                        return out_of_time()
+                    # No receipt yet: make the decision now rather than
+                    # refusing and asking the agent to make it. This is the
+                    # automatic part.
+                    receipt, failure = decide_now(repo, alongside)
+                    if failure is not None:
+                        return failure
             except (OSError, ValueError) as exc:
                 return Decision("deny", "gate_state_unavailable",
                                 f"delegation-first gate: routing state could not be read "
                                 f"({type(exc).__name__}); nothing is implemented until it can",
                                 repos)
-        if receipt is None:
-            return Decision(
-                "deny", "no_routing_receipt",
-                f"delegation-first gate: no routing receipt for {repo}. Register and claim "
-                f"the stage through agent-orchestration (stage_register, stage_claim), then "
-                f"call routing_decide with this repository; if the claim routes to the other "
-                f"provider, use execution_dispatch instead of editing here.", repos)
-        if receipt["valid_until"] <= now:
-            return Decision(
-                "deny", "routing_receipt_expired",
-                f"delegation-first gate: the routing receipt for {repo} (stage "
-                f"{receipt.get('item_id')}/{receipt.get('stage')}) expired. Renew the stage "
-                f"(stage_renew) and call routing_decide again.", repos, receipt)
-        if receipt["owner_route"] != client:
-            route = receipt["owner_route"]
-            call = "work_route_local" if route == "local" else "execution_dispatch"
-            automatic = ((" The routing decision was made automatically: "
-                          + str(receipt.get("code", "")) + ".")
-                         if receipt.get("automatic") else "")
-            return Decision(
-                "deny", "routed_elsewhere",
-                f"delegation-first gate: stage {receipt.get('item_id')}/{receipt.get('stage')} "
-                f"in {repo} is routed to {route}; this client does not implement it."
-                f"{automatic} Reason: {receipt.get('reason')}. Call {call} with "
-                f"item_id={receipt.get('item_id')!r}, stage={receipt.get('stage')!r}, "
-                f"owner_id={receipt.get('owner_id')!r}, "
-                f"stage_revision={receipt.get('stage_revision')} and your brief; the stage is "
-                f"already claimed, so no stage_register or stage_claim is needed.",
-                repos, receipt)
-        if capacity_db is not None:
-            stale = stage_binding(capacity_db, receipt, now)
-            if stale is not None:
+            if receipt is None:
                 return Decision(
-                    "deny", stale,
-                    f"delegation-first gate: the routing receipt for {repo} names stage "
-                    f"{receipt.get('item_id')}/{receipt.get('stage')}, but the stage router no longer "
-                    f"shows it owned by {receipt.get('owner_id')} on route {receipt.get('owner_route')} "
-                    f"({stale}). Claim or renew the stage, then call routing_decide again.", repos, receipt)
-    receipt = read_receipt(state_root, repos[0])
-    return Decision("allow", "routing_receipt_valid",
-                    f"stage {receipt.get('item_id')}/{receipt.get('stage')} is owned by this route",
+                    "deny", "no_routing_receipt",
+                    f"delegation-first gate: no routing receipt for {repo}. Register and claim "
+                    f"the stage through agent-orchestration (stage_register, stage_claim), then "
+                    f"call routing_decide with this repository; if the claim routes to the other "
+                    f"provider, use execution_dispatch instead of editing here.", repos)
+            if receipt["valid_until"] <= now:
+                return Decision(
+                    "deny", "routing_receipt_expired",
+                    f"delegation-first gate: the routing receipt for {repo} (stage "
+                    f"{receipt.get('item_id')}/{receipt.get('stage')}) expired. Renew the stage "
+                    f"(stage_renew) and call routing_decide again.", repos, receipt)
+            if receipt["owner_route"] != client:
+                route = receipt["owner_route"]
+                call = "work_route_local" if route == "local" else "execution_dispatch"
+                automatic = ((" The routing decision was made automatically: "
+                              + str(receipt.get("code", "")) + ".")
+                             if receipt.get("automatic") else "")
+                return Decision(
+                    "deny", "routed_elsewhere",
+                    f"delegation-first gate: stage {receipt.get('item_id')}/{receipt.get('stage')} "
+                    f"in {repo} is routed to {route}; this client does not implement it."
+                    f"{automatic} Reason: {receipt.get('reason')}. Call {call} with "
+                    f"item_id={receipt.get('item_id')!r}, stage={receipt.get('stage')!r}, "
+                    f"owner_id={receipt.get('owner_id')!r}, "
+                    f"stage_revision={receipt.get('stage_revision')} and your brief; the stage is "
+                    f"already claimed, so no stage_register or stage_claim is needed.",
                     repos, receipt)
+            if capacity_db is not None:
+                stale = stage_binding(capacity_db, receipt, now)
+                if stale is not None:
+                    return Decision(
+                        "deny", stale,
+                        f"delegation-first gate: the routing receipt for {repo} names stage "
+                        f"{receipt.get('item_id')}/{receipt.get('stage')}, but the stage router no longer "
+                        f"shows it owned by {receipt.get('owner_id')} on route {receipt.get('owner_route')} "
+                        f"({stale}). Claim or renew the stage, then call routing_decide again.", repos, receipt)
+            governing[repo] = receipt
+        receipt = governing[repos[0]]
+        return Decision("allow", "routing_receipt_valid",
+                        f"stage {receipt.get('item_id')}/{receipt.get('stage')} is owned by this route",
+                        repos, receipt)
+
+    # The whole judgment runs holding every enclosing repository's decision
+    # lock, which every writer of a routing receipt also takes (the gate here,
+    # ``routing_decide`` in the MCP). So the receipts read, the decision made
+    # and the receipt taken up are one consistent state: nothing is written
+    # between a read and the decision that depends on it, and two enclosing
+    # repositories cannot be seen at two different instants. Patching the
+    # read-after-write orderings one at a time found the next one each time.
+    # Acquired in the sorted order of ``repos``, one global order, so two
+    # gates never wait on each other in a cycle; ``routing_decide`` holds a
+    # single lock and cannot close one either.
+    try:
+        with contextlib.ExitStack() as held:
+            # One budget for all of them, so nested repositories cannot stack
+            # a full wait each against the hook's own timeout.
+            deadline = min(time.monotonic() + DECISION_LOCK_TIMEOUT_SECONDS, budget_ends)
+            for repo in repos:
+                held.enter_context(decision_lock(state_root, repo,
+                                                 timeout=deadline - time.monotonic()))
+            # After the wait, not before: a decision another process made
+            # meanwhile carries capacity observed after the old instant, and
+            # judged against that it read as overtaken and was made again.
+            now = float(clock())
+            return judge_held()
+    except OSError as exc:
+        # TimeoutError (a lock nobody released in time) is an OSError.
+        return Decision("deny", "gate_state_unavailable",
+                        f"delegation-first gate: routing state could not be locked "
+                        f"({type(exc).__name__}); nothing is implemented until it can", repos)
 
 
 def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
@@ -1648,12 +1907,13 @@ def automatic_decider(client: str, state_root: str, capacity_db: str,
     Imported lazily so ``gate`` stays importable without the stage router and
     so the two modules do not import each other at module scope.
     """
-    def decide(repo: str, task_type: str) -> Any:
+    def decide(repo: str, task_type: str, *, retained_alongside: bool = False) -> Any:
         from .autodecide import ensure_decision
 
         return ensure_decision(client=client, repo=repo, state_root=state_root,
                                capacity_db=capacity_db, task_type=task_type,
-                               local_queue_root=local_queue_root or None)
+                               local_queue_root=local_queue_root or None,
+                               retained_alongside=retained_alongside)
     return decide
 
 
@@ -2548,6 +2808,8 @@ def main(argv: list[str] | None = None) -> int:
     # a deny whatever went wrong on the way to it.
     state_root = None
     updated_input = None
+    out = _SingleDecision()
+    watchdog = _arm_watchdog(out)
     try:
         if not args.client:
             raise ValueError("--client is required in hook mode")
@@ -2586,7 +2848,8 @@ def main(argv: list[str] | None = None) -> int:
                 record_event(state_root, args.client or "unknown", "unknown", decision)
             except Exception:  # noqa: BLE001  the deny stands whether or not it could be logged
                 pass
-    sys.stdout.write(json.dumps(hook_output(decision, updated_input), sort_keys=True) + "\n")
+    if out.emit(json.dumps(hook_output(decision, updated_input), sort_keys=True) + "\n"):
+        watchdog.cancel()
     return 0
 
 

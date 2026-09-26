@@ -1649,5 +1649,559 @@ class ReviewFindingsFromTheOtherProvider(AutoCase):
         self.assertEqual(untouched["state"], "owned")
 
 
+class ARetainIsNotAClaimOnTheRepository(AutoCase):
+    """Reproduced 2026-09-24: a retain receipt denied the other assistant.
+
+    A retain decision means "the caller keeps its own work". Enforced as the
+    shared receipt it read as "this repository belongs to the caller", so the
+    second assistant was denied ``routed_elsewhere`` ("is routed to claude;
+    this client does not implement it") in every repository the policy
+    retains, until the receipt expired four hours later.
+    """
+
+    RETAINING_POLICIES = {
+        "no policy at all": {},
+        "local only": {"allowed_routes": ["local"]},
+        "both assistants, unclassified": {"allowed_routes": ["claude", "codex"]},
+    }
+
+    def decisions(self) -> list[dict]:
+        path = self.state / "routing" / gate.AUDIT_LEDGER
+        if not path.exists():
+            return []
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+        return [row for row in rows if row.get("event") == "routing_decided"]
+
+    def own_receipt(self, client: str) -> dict | None:
+        return gate.read_receipt(str(self.state), str(self.repo), client)
+
+    def arrange(self, entry: dict) -> None:
+        self.write_policy({str(self.repo): entry} if entry else {})
+        for route in ("claude", "codex", "local"):
+            self.observe(route)
+
+    def test_the_second_assistant_gets_its_own_retain_under_each_retaining_policy(self):
+        for label, entry in self.RETAINING_POLICIES.items():
+            for first, second in (("claude", "codex"), ("codex", "claude")):
+                with self.subTest(policy=label, first=first):
+                    self.setUp()
+                    self.arrange(entry)
+                    self.assertAllowed(self.hook(first, self.repo))
+                    shared = self.receipt_for(self.repo)
+                    self.assertTrue(shared["code"].startswith("retained_"), shared["code"])
+                    self.assertEqual(shared["owner_route"], first)
+
+                    self.assertAllowed(self.hook(second, self.repo))
+                    own = self.own_receipt(second)
+                    self.assertIsNotNone(own)
+                    self.assertTrue(own["code"].startswith("retained_"), own["code"])
+                    self.assertEqual(own["caller"], second)
+                    self.assertEqual(own["owner_route"], second)
+                    self.assertEqual(own["owner_id"], autodecide.owner_id_for(second))
+                    self.assertTrue(own["retained_alongside"])
+                    # The first assistant's decision is untouched, not overwritten.
+                    self.assertEqual(self.receipt_for(self.repo), shared)
+                    self.assertAllowed(self.hook(first, self.repo))
+
+    def test_the_two_retains_hold_different_stages(self):
+        """Stage ownership: neither edits under a lease the other holds."""
+        self.arrange({})
+        self.hook("claude", self.repo)
+        self.hook("codex", self.repo)
+        shared, own = self.receipt_for(self.repo), self.own_receipt("codex")
+        self.assertEqual(shared["item_id"], own["item_id"])
+        self.assertNotEqual(shared["stage"], own["stage"])
+        router = StageRouter(str(self.db))
+        self.assertEqual(router.get(own["item_id"], own["stage"])["owner_id"],
+                         autodecide.owner_id_for("codex"))
+        self.assertEqual(router.get(shared["item_id"], shared["stage"])["owner_id"],
+                         autodecide.owner_id_for("claude"))
+
+    def test_alternating_assistants_decide_once_each_and_then_never_again(self):
+        """No churn and no livelock: nobody re-decides the other's retain."""
+        self.arrange({})
+        outcomes = []
+        for _ in range(4):
+            outcomes.append(self.hook("claude", self.repo) == {})
+            outcomes.append(self.hook("codex", self.repo) == {})
+        self.assertEqual(outcomes, [True] * 8)
+        self.assertEqual([row["caller"] for row in self.decisions()], ["claude", "codex"])
+
+    def test_a_routed_away_decision_still_binds(self):
+        """The first client routed to its peer stays denied; the peer proceeds."""
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}})
+        self.observe("codex")
+        self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        self.assertAllowed(self.hook("codex", self.repo))
+        self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        self.assertIsNone(self.own_receipt("claude"))
+        self.assertIsNone(self.own_receipt("codex"))
+
+    def test_a_decision_routing_away_replaces_the_other_retain_and_binds(self):
+        """The arriving client's own decision can route its work away. That is
+        written to the shared receipt, not beside it, and it binds."""
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}}, prefer=["claude", "codex"])
+        self.observe("codex")
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["code"], "retained_is_the_policy")
+        # codex's own decision: both are eligible and claude is preferred, so
+        # codex's work goes to claude. That is a routing, not a retain.
+        self.assertDenied(self.hook("codex", self.repo), "routed_elsewhere")
+        shared = self.receipt_for(self.repo)
+        self.assertEqual((shared["caller"], shared["owner_route"], shared["code"]),
+                         ("codex", "claude", "routed_peer_implementation"))
+        self.assertIsNone(self.own_receipt("codex"))
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertDenied(self.hook("codex", self.repo), "routed_elsewhere")
+
+    def test_a_manual_retain_still_binds_the_other_client(self):
+        """Only an automatic retain is read as the caller keeping its work."""
+        self.arrange({})
+        self.assertAllowed(self.hook("claude", self.repo))
+        shared = dict(self.receipt_for(self.repo))
+        shared.pop("automatic")
+        store_path = gate.receipt_path(str(self.state), str(self.repo))
+        Path(store_path).write_text(json.dumps(shared), encoding="utf-8")
+        self.assertDenied(self.hook("codex", self.repo), "routed_elsewhere")
+
+    def test_an_unreadable_own_slot_fails_closed(self):
+        self.arrange({})
+        self.hook("claude", self.repo)
+        self.hook("codex", self.repo)
+        Path(gate.receipt_path(str(self.state), str(self.repo), "codex")).write_text(
+            "{not json", encoding="utf-8")
+        self.assertDenied(self.hook("codex", self.repo), "gate_state_unavailable")
+        self.assertAllowed(self.hook("claude", self.repo))
+
+    def test_a_forged_own_slot_is_not_a_receipt(self):
+        """A routed-away document planted in the slot cannot bind or free anyone."""
+        self.arrange({})
+        self.hook("claude", self.repo)
+        self.hook("codex", self.repo)
+        path = Path(gate.receipt_path(str(self.state), str(self.repo), "codex"))
+        forged = json.loads(path.read_text(encoding="utf-8"))
+        forged.update(owner_route="local", decision="local", code="routed_local_mechanical")
+        path.write_text(json.dumps(forged), encoding="utf-8")
+        self.assertDenied(self.hook("codex", self.repo), "gate_state_unavailable")
+
+    def test_a_slot_document_copied_into_the_shared_receipt_is_refused(self):
+        self.arrange({})
+        self.hook("claude", self.repo)
+        self.hook("codex", self.repo)
+        own = Path(gate.receipt_path(str(self.state), str(self.repo), "codex"))
+        Path(gate.receipt_path(str(self.state), str(self.repo))).write_text(
+            own.read_text(encoding="utf-8"), encoding="utf-8")
+        self.assertDenied(self.hook("claude", self.repo), "gate_state_unavailable")
+
+    def test_an_unreadable_policy_still_fails_closed_for_the_arriving_client(self):
+        self.arrange({})
+        self.assertAllowed(self.hook("claude", self.repo))
+        Path(autoroute.policy_path(str(self.state))).write_text("{", encoding="utf-8")
+        # codex has no receipt of its own yet, so it must decide, and the
+        # decision cannot read the policy.
+        self.assertDenied(self.hook("codex", self.repo), "gate_auto_decision_failed")
+
+    def test_the_own_retain_is_re_made_when_it_is_overtaken(self):
+        """Made and re-made like a shared one: here, its stage completed."""
+        self.arrange({})
+        self.hook("claude", self.repo)
+        self.hook("codex", self.repo)
+        first = self.own_receipt("codex")
+        router = StageRouter(str(self.db))
+        current = router.get(first["item_id"], first["stage"])
+        router.complete(first["item_id"], first["stage"], owner_id=first["owner_id"],
+                        expected_revision=current["revision"])
+        self.assertAllowed(self.hook("codex", self.repo))
+        again = self.own_receipt("codex")
+        self.assertNotEqual(again["stage"], first["stage"])
+        self.assertEqual(self.receipt_for(self.repo)["caller"], "claude")
+
+    def test_the_other_retain_is_never_re_decided_by_the_arrival(self):
+        """Whether their retain is stale is theirs to find out: a policy change
+        overtakes it, but codex re-decides only its own slot."""
+        self.arrange({})
+        self.hook("claude", self.repo)
+        shared = self.receipt_for(self.repo)
+        self.write_policy({}, prefer=["codex"])
+        self.assertAllowed(self.hook("codex", self.repo))
+        self.assertEqual(self.receipt_for(self.repo), shared)
+        self.assertIsNotNone(self.own_receipt("codex"))
+        # claude, arriving, re-decides its own shared retain under the new policy.
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertNotEqual(self.receipt_for(self.repo)["policy_fingerprint"],
+                            shared["policy_fingerprint"])
+
+    def judge_in_process(self, client: str, decide=None):
+        patch = ("*** Begin Patch\n*** Update File: app.py\n@@\n-x = 1\n+x = 2\n"
+                 "*** End Patch\n")
+        tool, tool_input = (("apply_patch", {"input": patch}) if client == "codex"
+                            else ("Edit", {"file_path": str(self.repo / "app.py")}))
+        return gate.judge(client, tool, tool_input, str(self.repo), state_root=str(self.state),
+                          capacity_db=str(self.db),
+                          decide=decide or gate.automatic_decider(client, str(self.state),
+                                                                  str(self.db)))
+
+    def test_a_concurrent_retain_cannot_resurrect_a_stale_own_slot(self):
+        """Codex's finding 1: the post-decision read must be the decision made.
+
+        codex holds an old slot retain; the policy changes so codex's own
+        decision now routes its work to claude. Between that write and the
+        gate's read, claude re-decides and puts a retain back in the shared
+        slot. Re-reading found codex's stale slot behind it and allowed codex.
+        """
+        self.arrange({})
+        self.hook("claude", self.repo)
+        self.hook("codex", self.repo)
+        self.assertIsNotNone(self.own_receipt("codex"))
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}}, prefer=["claude", "codex"])
+        codex_decide = gate.automatic_decider("codex", str(self.state), str(self.db))
+        claude_decide = gate.automatic_decider("claude", str(self.state), str(self.db))
+
+        def racing(repo, task_type, **kwargs):
+            outcome = codex_decide(repo, task_type, **kwargs)
+            self.assertEqual(outcome.receipt["code"], "routed_peer_implementation")
+            claude_decide(repo, task_type)             # the interleaved write
+            self.assertTrue(gate.is_another_clients_retain(self.receipt_for(self.repo),
+                                                           "codex"))
+            return outcome
+
+        decision = self.judge_in_process("codex", racing)
+        self.assertEqual((decision.permission, decision.code), ("deny", "routed_elsewhere"))
+
+    def test_no_receipt_writer_can_enter_while_a_decision_is_in_flight(self):
+        """The lock, not an ordering patch, closes the post-decision races:
+        while the gate is deciding, nobody else can take the decision lock."""
+        from unittest import mock
+
+        self.arrange({})
+        self.hook("claude", self.repo)
+        codex_decide = gate.automatic_decider("codex", str(self.state), str(self.db))
+        attempts = []
+
+        def deciding(repo, task_type, **kwargs):
+            try:
+                with gate.decision_lock(str(self.state), repo):
+                    attempts.append("entered")
+            except TimeoutError:
+                attempts.append("excluded")
+            return codex_decide(repo, task_type, **kwargs)
+
+        with mock.patch.object(gate, "DECISION_LOCK_TIMEOUT_SECONDS", 0.2):
+            decision = self.judge_in_process("codex", deciding)
+        self.assertEqual(attempts, ["excluded"])
+        self.assertEqual(decision.permission, "allow")
+
+    def test_a_held_decision_lock_fails_closed(self):
+        from unittest import mock
+
+        self.arrange({})
+        self.hook("claude", self.repo)
+        with mock.patch.object(gate, "DECISION_LOCK_TIMEOUT_SECONDS", 0.2), \
+                gate.decision_lock(str(self.state), str(self.repo)):
+            decision = self.judge_in_process("codex")
+        self.assertEqual((decision.permission, decision.code),
+                         ("deny", "gate_state_unavailable"))
+        self.assertIsNone(self.own_receipt("codex"))
+
+    def test_a_decision_made_while_waiting_is_taken_not_repeated(self):
+        """The double check under the lock: another process decided first."""
+        import threading
+
+        self.arrange({})
+        self.hook("claude", self.repo)
+        codex_decide = gate.automatic_decider("codex", str(self.state), str(self.db))
+        held = threading.Event()
+        other: dict = {}
+        gate_calls = []
+
+        def other_process():
+            # Holds the lock before the gate below starts, so the gate's
+            # first read happens only after this decision is written.
+            try:
+                with gate.decision_lock(str(self.state), str(self.repo)):
+                    held.set()
+                    time.sleep(0.5)
+                    other["outcome"] = codex_decide(str(self.repo), "implementation",
+                                                    retained_alongside=True)
+            except BaseException as exc:  # noqa: BLE001  reported below
+                other["error"] = exc
+
+        def counting(repo, task_type, **kwargs):
+            gate_calls.append(repo)
+            return codex_decide(repo, task_type, **kwargs)
+
+        thread = threading.Thread(target=other_process)
+        thread.start()
+        self.assertTrue(held.wait(10))
+        decision = self.judge_in_process("codex", counting)
+        thread.join(10)
+        self.assertNotIn("error", other)
+        self.assertEqual(decision.permission, "allow")
+        self.assertEqual(gate_calls, [], "the gate decided a second time")
+        self.assertEqual(decision.receipt, other["outcome"].receipt)
+
+    def test_even_an_existing_receipt_is_read_under_the_lock(self):
+        """Codex's round-four finding 1: no unlocked fast path. While a writer
+        holds the lock, a client with a valid receipt waits rather than
+        allowing from a receipt the writer may be replacing."""
+        from unittest import mock
+
+        self.arrange({})
+        self.hook("claude", self.repo)
+        self.hook("codex", self.repo)
+        self.assertEqual(self.judge_in_process("codex").permission, "allow")
+        with mock.patch.object(gate, "DECISION_LOCK_TIMEOUT_SECONDS", 0.2), \
+                gate.decision_lock(str(self.state), str(self.repo)):
+            decision = self.judge_in_process("codex")
+        self.assertEqual((decision.permission, decision.code),
+                         ("deny", "gate_state_unavailable"))
+
+    def test_nested_repositories_are_judged_under_all_their_locks(self):
+        """Codex's round-four finding 2: an outer and an inner receipt are read
+        as one state, so an edit in the inner repository waits for a writer
+        holding only the outer repository's lock."""
+        from unittest import mock
+
+        inner = git_repo(self.repo / "inner")
+        self.arrange({})
+        self.assertAllowed(self.hook("codex", inner, "mod.py"))
+        patch = ("*** Begin Patch\n*** Update File: mod.py\n@@\n-x = 1\n+x = 2\n"
+                 "*** End Patch\n")
+
+        def judge_inner():
+            return gate.judge("codex", "apply_patch", {"input": patch}, str(inner),
+                              state_root=str(self.state), capacity_db=str(self.db),
+                              decide=gate.automatic_decider("codex", str(self.state),
+                                                            str(self.db)))
+
+        self.assertEqual(judge_inner().permission, "allow")
+        with mock.patch.object(gate, "DECISION_LOCK_TIMEOUT_SECONDS", 0.2), \
+                gate.decision_lock(str(self.state), str(self.repo)):
+            decision = judge_inner()
+        self.assertEqual((decision.permission, decision.code),
+                         ("deny", "gate_state_unavailable"))
+
+    def test_nested_locks_share_one_wait_budget(self):
+        """Two enclosing repositories must not stack two full waits against
+        the hook's own timeout."""
+        from unittest import mock
+
+        inner = git_repo(self.repo / "inner")
+        self.arrange({})
+        self.hook("codex", inner, "mod.py")
+        patch = ("*** Begin Patch\n*** Update File: mod.py\n@@\n-x = 1\n+x = 2\n"
+                 "*** End Patch\n")
+        with mock.patch.object(gate, "DECISION_LOCK_TIMEOUT_SECONDS", 0.5), \
+                gate.decision_lock(str(self.state), str(inner)):
+            started = time.monotonic()
+            decision = gate.judge("codex", "apply_patch", {"input": patch}, str(inner),
+                                  state_root=str(self.state), capacity_db=str(self.db),
+                                  decide=gate.automatic_decider("codex", str(self.state),
+                                                                str(self.db)))
+            waited = time.monotonic() - started
+        self.assertEqual(decision.code, "gate_state_unavailable")
+        self.assertLess(waited, 0.9, "each repository waited a full budget of its own")
+
+    def test_an_existing_own_slot_is_no_escape_from_a_binding_shared_receipt(self):
+        """Once codex holds its own retain, a binding shared receipt (manual,
+        or routed away) still denies it: the slot governs only while the
+        shared receipt is another client's automatic retain."""
+        for kind in ("manual", "routed-away"):
+            with self.subTest(kind=kind):
+                self.setUp()
+                self.arrange({})
+                self.hook("claude", self.repo)
+                self.assertAllowed(self.hook("codex", self.repo))
+                self.assertIsNotNone(self.own_receipt("codex"))
+                shared_path = Path(gate.receipt_path(str(self.state), str(self.repo)))
+                binding = json.loads(shared_path.read_text(encoding="utf-8"))
+                if kind == "manual":
+                    binding.pop("automatic")
+                else:
+                    binding.update(decision="peer", code="routed_peer_implementation",
+                                   caller="codex", owner_route="claude")
+                shared_path.write_text(json.dumps(binding), encoding="utf-8")
+                self.assertDenied(self.hook("codex", self.repo), "routed_elsewhere")
+
+    def test_the_judgment_denies_rather_than_outrun_the_hook_timeout(self):
+        """A host runs the tool when a hook produces no decision, so a gate
+        killed for running long fails open. Past its own budget the judgment
+        denies instead of starting more work."""
+        from unittest import mock
+
+        self.arrange({})
+        with mock.patch.object(gate, "JUDGMENT_BUDGET_SECONDS", 0.0):
+            decision = self.judge_in_process("codex")
+        self.assertEqual((decision.permission, decision.code),
+                         ("deny", "gate_state_unavailable"))
+        self.assertIsNone(self.receipt_for(self.repo))
+
+    def test_the_hook_process_denies_on_its_watchdog_when_the_judgment_is_stuck(self):
+        """The hard bound, end to end in a real hook process: the judgment is
+        stuck (here, waiting on a lock the test holds), and the watchdog
+        writes a deny and exits before the host could time the hook out."""
+        self.arrange({})
+        payload = {"hook_event_name": "PreToolUse", "tool_name": "Edit",
+                   "tool_input": {"file_path": str(self.repo / "app.py")}, "cwd": str(self.repo)}
+        env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), gate.HOOK_WATCHDOG_ENV: "0.5"}
+        with gate.decision_lock(str(self.state), str(self.repo)):
+            started = time.monotonic()
+            completed = subprocess.run(
+                [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
+                 "--client", "claude", "--config", str(self.config)],
+                input=json.dumps(payload).encode("utf-8"), capture_output=True,
+                timeout=60, env=env)
+            elapsed = time.monotonic() - started
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        out = json.loads(completed.stdout)
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertTrue(reason.endswith("[gate_timeout]"), reason)
+        self.assertEqual(completed.stdout.count(b"hookSpecificOutput"), 1)
+        self.assertLess(elapsed, gate.DECISION_LOCK_TIMEOUT_SECONDS,
+                        "the deny waited for the lock timeout, not the watchdog")
+
+    def test_the_watchdog_can_only_be_lowered(self):
+        from unittest import mock
+
+        for value, expected in (("0.5", 0.5), ("60", gate.HOOK_WATCHDOG_SECONDS),
+                                ("nan", gate.HOOK_WATCHDOG_SECONDS),
+                                ("-1", gate.HOOK_WATCHDOG_SECONDS),
+                                ("x", gate.HOOK_WATCHDOG_SECONDS)):
+            with self.subTest(value=value), \
+                    mock.patch.dict(os.environ, {gate.HOOK_WATCHDOG_ENV: value}):
+                self.assertEqual(gate._watchdog_seconds(), expected)
+
+    def test_a_deeply_nested_routed_away_deny_arrives_well_inside_the_budget(self):
+        """Measured on the previous design: five nested repositories, first
+        decision, routed-away innermost, 10.3 s -- past the 10 s hook timeout,
+        with no contention at all. Under the lock a missing receipt is read
+        without the store's one-second retry window."""
+        deepest = self.repo
+        for depth in range(4):
+            deepest = git_repo(deepest / f"n{depth}")
+        self.write_policy({str(deepest): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}}, prefer=["claude", "codex", "local"])
+        for route in ("claude", "codex", "local"):
+            self.observe(route)
+        started = time.monotonic()
+        reason = self.assertDenied(self.hook("codex", deepest, "mod.py"), "routed_elsewhere")
+        elapsed = time.monotonic() - started
+        self.assertIn("routed to claude", reason)
+        # Measured 0.14 s here; one retry window per missing receipt would be
+        # about 5 s. The bound leaves room for a slow CI host's interpreter
+        # start-up and still catches that regression.
+        self.assertLess(elapsed, 3.0, f"a routed-away deny took {elapsed:.1f} s")
+
+    def test_routing_decide_takes_the_same_lock(self):
+        """The hand-made writer is serialised with the gate too."""
+        from unittest import mock
+
+        from agent_bridge.localq.intake import AutomaticIntake
+        from agent_bridge.localq.spool import FakeBackend, LocalQueue, ResourceSnapshot
+        from agent_bridge.orchestration import mcp
+
+        class Idle:
+            def sample(self):
+                return ResourceSnapshot(0.0, "normal", "normal", True, 10_000, cpu_load_ratio=0.1)
+
+        self.observe("claude")
+        router = StageRouter(str(self.db))
+        registered = router.register("manual-item", "implementation", allowed_routes=["claude"])
+        owned = router.assign("manual-item", "implementation", owner_id="an-agent",
+                              lease_seconds=600, expected_revision=registered["revision"])
+        queue = LocalQueue(self.base / "queue", sampler=Idle(), backend=FakeBackend())
+        tools = mcp.build_tools("claude", router, queue, AutomaticIntake(queue),
+                                state_root=str(self.state))
+        args = {"item_id": "manual-item", "stage": "implementation", "owner_id": "an-agent",
+                "stage_revision": owned["revision"], "repo": str(self.repo),
+                "reason": "chosen by hand"}
+        with mock.patch.object(gate, "DECISION_LOCK_TIMEOUT_SECONDS", 0.2), \
+                gate.decision_lock(str(self.state), str(self.repo)):
+            refused = tools["routing_decide"]["handler"](args)
+        self.assertFalse(refused["ok"], refused)
+        self.assertIsNone(self.receipt_for(self.repo))
+        self.assertTrue(tools["routing_decide"]["handler"](args)["ok"])
+
+    def test_a_decider_reporting_nothing_does_not_revive_an_overtaken_slot(self):
+        self.arrange({})
+        self.hook("claude", self.repo)
+        self.hook("codex", self.repo)
+        own = self.own_receipt("codex")
+        router = StageRouter(str(self.db))
+        router.complete(own["item_id"], own["stage"], owner_id=own["owner_id"],
+                        expected_revision=router.get(own["item_id"], own["stage"])["revision"])
+        decision = self.judge_in_process("codex", lambda repo, task_type, **kwargs: None)
+        self.assertEqual((decision.permission, decision.code), ("deny", "no_routing_receipt"))
+
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                     "POSIX permission bits; root reads anything")
+    def test_an_os_error_on_either_receipt_fails_closed(self):
+        """Codex's finding 2: only a missing file is "no receipt"."""
+        self.arrange({})
+        self.hook("claude", self.repo)
+        self.hook("codex", self.repo)
+        for slot in ("codex", None):
+            with self.subTest(slot=slot):
+                path = gate.receipt_path(str(self.state), str(self.repo), slot)
+                os.chmod(path, 0)
+                try:
+                    decision = self.judge_in_process("codex")
+                    self.assertEqual((decision.permission, decision.code),
+                                     ("deny", "gate_state_unavailable"))
+                finally:
+                    os.chmod(path, 0o600)
+        self.assertEqual(self.judge_in_process("codex").permission, "allow")
+
+    def test_a_different_task_type_does_not_make_the_clients_take_turns(self):
+        """Codex's finding 3. The hook's task type is always implementation
+        today; forced here, neither client re-decides the other's retain."""
+        from unittest import mock
+
+        self.arrange({})
+        self.assertEqual(self.judge_in_process("claude").permission, "allow")
+        before = len(self.decisions())
+        with mock.patch.object(gate, "infer_task_type", return_value="review"):
+            for _ in range(3):
+                self.assertEqual(self.judge_in_process("codex").permission, "allow")
+        self.assertEqual(self.judge_in_process("claude").permission, "allow")
+        self.assertEqual(len(self.decisions()), before + 1)
+        self.assertEqual(self.receipt_for(self.repo)["caller"], "claude")
+
+    def test_every_enclosing_repository_is_judged_on_its_own_receipt(self):
+        """An outer retain is not a claim; each repository gets its own decision."""
+        inner = git_repo(self.repo / "inner")
+        self.arrange({})
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertAllowed(self.hook("codex", inner, "mod.py"))
+        self.assertIsNotNone(self.own_receipt("codex"))
+        self.assertEqual(gate.read_receipt(str(self.state), str(inner))["caller"], "codex")
+
+    def test_an_outer_routing_binds_an_edit_in_a_nested_repository(self):
+        inner = git_repo(self.repo / "inner")
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}})
+        self.observe("codex")
+        self.assertDenied(self.hook("claude", inner, "mod.py"), "routed_elsewhere")
+
+    def test_the_retain_beside_another_leaves_the_intent_alone(self):
+        self.arrange({})
+        self.hook("claude", self.repo)
+        intent = Path(autodecide.intent_path(str(self.state), str(self.repo)))
+        intent.parent.mkdir(parents=True, exist_ok=True)
+        intent.write_text(json.dumps({"version": 1, "route": "local"}), encoding="utf-8")
+        self.assertAllowed(self.hook("codex", self.repo))
+        self.assertTrue(intent.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

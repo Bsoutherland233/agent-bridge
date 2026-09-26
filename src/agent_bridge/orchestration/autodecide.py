@@ -445,12 +445,20 @@ def ensure_decision(*, client: str, repo: str, state_root: str, capacity_db: str
                     ttl_seconds: int = DEFAULT_TTL_SECONDS,
                     clock: Any = time.time,
                     load: autoroute.Load | None = None,
-                    local_queue_root: str | None = None) -> Outcome:
+                    local_queue_root: str | None = None,
+                    retained_alongside: bool = False) -> Outcome:
     """Compute, establish and record the routing decision for one repository.
 
     Raises :class:`AutoDecisionError` for anything it cannot do, so the gate
     fails closed. It never returns a receipt it did not write and never
     reports a route the router does not actually show as owned.
+
+    ``retained_alongside`` is the gate saying another client's automatic
+    retain holds the shared receipt (``gate.is_another_clients_retain``). A
+    retain is then recorded in this client's own slot, beside theirs, and
+    leaves the dispatch-intent bookkeeping to the shared decision. A decision
+    that routes the work away ignores the flag and replaces the shared
+    receipt, because a routed-away decision binds both clients.
     """
     if client not in autoroute.PEER_FOR_CLIENT:
         raise AutoDecisionError("client_invalid")
@@ -523,18 +531,24 @@ def ensure_decision(*, client: str, repo: str, state_root: str, capacity_db: str
         raise AutoDecisionError(
             f"stage_owned_by_another_route:{record.get('owner_route')}")
     reason = decision.reason[:gate.MAX_REASON]
+    alongside = retained_alongside and decision.route == autoroute.RETAIN
     try:
         receipt = gate.record_decision(
             state_root, caller=client, stage_record=record, repo=repo_root,
             reason=reason, ttl_seconds=int(ttl_seconds), clock=clock,
             code=decision.code, considered=dict(decision.considered),
             automatic=True, policy_fingerprint=policy_digest,
-            capacity_fingerprint=capacity_digest)
+            capacity_fingerprint=capacity_digest, retained_alongside=alongside)
     except (RoutingError, OSError, ValueError) as exc:
         raise AutoDecisionError(f"receipt_write_failed:{type(exc).__name__}") from None
 
     intent = None
-    if decision.dispatches and receipt["owner_route"] != client:
+    if alongside:
+        # The shared receipt is another client's decision and the repository's
+        # one intent file belongs to that bookkeeping; a retain beside it owes
+        # nothing and supersedes nothing.
+        pass
+    elif decision.dispatches and receipt["owner_route"] != client:
         try:
             intent = _write_intent(state_root, receipt=receipt, decision=decision,
                                    clock=clock)

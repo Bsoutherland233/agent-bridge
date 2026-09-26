@@ -498,10 +498,13 @@ def build_tools(caller: str, router: StageRouter, queue: LocalQueue,
             if (current["state"] != "owned" or current["owner_id"] != args.get("owner_id")
                     or current["revision"] != args.get("stage_revision")):
                 raise RoutingError("execution_stage_binding_invalid")
-            receipt = gate.record_decision(
-                state_root, caller=caller, stage_record=current, repo=args.get("repo"),
-                reason=args.get("reason"), ttl_seconds=args.get("ttl_seconds", 4 * 3600),
-                clock=router.clock)
+            # The same lock the gate holds while it decides, so a hand-made
+            # receipt never lands between the gate's decision and its read.
+            with gate.decision_lock(state_root, args.get("repo")):
+                receipt = gate.record_decision(
+                    state_root, caller=caller, stage_record=current, repo=args.get("repo"),
+                    reason=args.get("reason"), ttl_seconds=args.get("ttl_seconds", 4 * 3600),
+                    clock=router.clock)
             return {"ok": True, "receipt": receipt}
         except (RoutingError, TypeError, ValueError, OSError) as exc:
             return {"ok": False, "error": str(exc) or type(exc).__name__}
