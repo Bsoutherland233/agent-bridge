@@ -365,7 +365,15 @@ class WindowsPlatform:
         deadline = time.monotonic() + timeout
         os.lseek(fd, 0, os.SEEK_SET)
         if os.fstat(fd).st_size == 0:
-            os.write(fd, b"\0")
+            # Another handle may have written this byte and locked it between
+            # the size check and this write; LockFile's range lock then makes
+            # the write fail with ERROR_LOCK_VIOLATION. That handle holds the
+            # lock, so wait for it in the loop below rather than escaping
+            # with a PermissionError on the first contended use.
+            try:
+                os.write(fd, b"\0")
+            except OSError:
+                pass
         while True:
             try:
                 os.lseek(fd, 0, os.SEEK_SET)

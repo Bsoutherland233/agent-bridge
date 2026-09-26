@@ -1914,30 +1914,38 @@ class ARetainIsNotAClaimOnTheRepository(AutoCase):
         """The double check under the lock: another process decided first."""
         import threading
 
-        from agent_bridge import store
-
         self.arrange({})
         self.hook("claude", self.repo)
         codex_decide = gate.automatic_decider("codex", str(self.state), str(self.db))
         held = threading.Event()
-        before = len(self.decisions())
+        other: dict = {}
+        gate_calls = []
 
         def other_process():
-            # Holds the lock first and decides only after the gate below has
-            # made its unlocked read (a missing receipt costs the store's
-            # one-second atomic-read grace) and started waiting.
-            with gate.decision_lock(str(self.state), str(self.repo)):
-                held.set()
-                time.sleep(store.ATOMIC_READ_GRACE_SECONDS + 1.0)
-                codex_decide(str(self.repo), "implementation", retained_alongside=True)
+            # Holds the lock before the gate below starts, so the gate's
+            # first read happens only after this decision is written.
+            try:
+                with gate.decision_lock(str(self.state), str(self.repo)):
+                    held.set()
+                    time.sleep(0.5)
+                    other["outcome"] = codex_decide(str(self.repo), "implementation",
+                                                    retained_alongside=True)
+            except BaseException as exc:  # noqa: BLE001  reported below
+                other["error"] = exc
+
+        def counting(repo, task_type, **kwargs):
+            gate_calls.append(repo)
+            return codex_decide(repo, task_type, **kwargs)
 
         thread = threading.Thread(target=other_process)
         thread.start()
         self.assertTrue(held.wait(10))
-        decision = self.judge_in_process("codex")
+        decision = self.judge_in_process("codex", counting)
         thread.join(10)
+        self.assertNotIn("error", other)
         self.assertEqual(decision.permission, "allow")
-        self.assertEqual(len(self.decisions()), before + 1, "the gate decided a second time")
+        self.assertEqual(gate_calls, [], "the gate decided a second time")
+        self.assertEqual(decision.receipt, other["outcome"].receipt)
 
     def test_even_an_existing_receipt_is_read_under_the_lock(self):
         """Codex's round-four finding 1: no unlocked fast path. While a writer
@@ -2000,6 +2008,62 @@ class ARetainIsNotAClaimOnTheRepository(AutoCase):
             waited = time.monotonic() - started
         self.assertEqual(decision.code, "gate_state_unavailable")
         self.assertLess(waited, 0.9, "each repository waited a full budget of its own")
+
+    def test_an_existing_own_slot_is_no_escape_from_a_binding_shared_receipt(self):
+        """Once codex holds its own retain, a binding shared receipt (manual,
+        or routed away) still denies it: the slot governs only while the
+        shared receipt is another client's automatic retain."""
+        for kind in ("manual", "routed-away"):
+            with self.subTest(kind=kind):
+                self.setUp()
+                self.arrange({})
+                self.hook("claude", self.repo)
+                self.assertAllowed(self.hook("codex", self.repo))
+                self.assertIsNotNone(self.own_receipt("codex"))
+                shared_path = Path(gate.receipt_path(str(self.state), str(self.repo)))
+                binding = json.loads(shared_path.read_text(encoding="utf-8"))
+                if kind == "manual":
+                    binding.pop("automatic")
+                else:
+                    binding.update(decision="peer", code="routed_peer_implementation",
+                                   caller="codex", owner_route="claude")
+                shared_path.write_text(json.dumps(binding), encoding="utf-8")
+                self.assertDenied(self.hook("codex", self.repo), "routed_elsewhere")
+
+    def test_the_judgment_denies_rather_than_outrun_the_hook_timeout(self):
+        """A host runs the tool when a hook produces no decision, so a gate
+        killed for running long fails open. Past its own budget the judgment
+        denies instead of starting more work."""
+        from unittest import mock
+
+        self.arrange({})
+        with mock.patch.object(gate, "JUDGMENT_BUDGET_SECONDS", 0.0):
+            decision = self.judge_in_process("codex")
+        self.assertEqual((decision.permission, decision.code),
+                         ("deny", "gate_state_unavailable"))
+        self.assertIsNone(self.receipt_for(self.repo))
+
+    def test_a_deeply_nested_routed_away_deny_arrives_well_inside_the_budget(self):
+        """Measured on the previous design: five nested repositories, first
+        decision, routed-away innermost, 10.3 s -- past the 10 s hook timeout,
+        with no contention at all. Under the lock a missing receipt is read
+        without the store's one-second retry window."""
+        deepest = self.repo
+        for depth in range(4):
+            deepest = git_repo(deepest / f"n{depth}")
+        self.write_policy({str(deepest): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}}, prefer=["claude", "codex", "local"])
+        for route in ("claude", "codex", "local"):
+            self.observe(route)
+        started = time.monotonic()
+        reason = self.assertDenied(self.hook("codex", deepest, "mod.py"), "routed_elsewhere")
+        elapsed = time.monotonic() - started
+        self.assertIn("routed to claude", reason)
+        # Measured 0.14 s here; one retry window per missing receipt would be
+        # about 5 s. The bound leaves room for a slow CI host's interpreter
+        # start-up and still catches that regression.
+        self.assertLess(elapsed, 3.0, f"a routed-away deny took {elapsed:.1f} s")
 
     def test_routing_decide_takes_the_same_lock(self):
         """The hand-made writer is serialised with the gate too."""

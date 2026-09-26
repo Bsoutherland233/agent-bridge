@@ -413,9 +413,19 @@ def receipt_path(state_root: str, repo: str, retained_by: str | None = None) -> 
 #: subdirectory, so ``list_receipts`` (which lists ``*.json`` here) never
 #: sees them.
 LOCK_DIR = "locks"
-#: Well inside the hook's own 10 s timeout, so a stuck holder produces this
-#: gate's fail-closed deny rather than a host timeout.
-DECISION_LOCK_TIMEOUT_SECONDS = 5.0
+#: The whole write judgment -- locks, reads, any decision and the stage
+#: check -- must finish inside the hook entry's own 10 s timeout, because a
+#: host reads a hook that produced no decision as a non-blocking error and
+#: runs the tool (REVIEW-HISTORY item 61): a gate killed for running long
+#: fails open. So the judgment has a deadline of its own, measured from when
+#: it starts, and denies rather than start more work once it has passed. The
+#: margin is for interpreter start-up and the presence write before it.
+JUDGMENT_BUDGET_SECONDS = 7.0
+#: The longest the judgment waits for the decision locks, shared across all
+#: of a call's enclosing repositories and never more than the judgment has
+#: left. A holder that keeps them longer produces this gate's fail-closed
+#: deny rather than a host timeout.
+DECISION_LOCK_TIMEOUT_SECONDS = 3.0
 
 
 @contextlib.contextmanager
@@ -570,7 +580,7 @@ def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any
 
 
 def read_receipt(state_root: str, repo: str,
-                 retained_by: str | None = None) -> dict[str, Any] | None:
+                 retained_by: str | None = None, *, grace: bool = True) -> dict[str, Any] | None:
     """The receipt for ``repo`` or None; ValueError for one that is not a receipt.
 
     ``retained_by`` reads that client's own retain slot rather than the shared
@@ -590,7 +600,12 @@ def read_receipt(state_root: str, repo: str,
     """
     path = receipt_path(state_root, repo, retained_by)
     try:
-        loaded = store.read_json_atomic(path)
+        # ``grace=False`` is for a reader that holds the repository's
+        # decision lock: every writer holds it too, so no replace can be in
+        # flight and a missing file is genuinely absent. Skipping the retry
+        # window there saves a second per missing receipt, which the hook's
+        # time budget needs (see ``JUDGMENT_BUDGET_SECONDS``).
+        loaded = store.read_json_atomic(path) if grace else store.read_json(path)
     except FileNotFoundError:
         return None
     # Any other OSError (a permission refusal or I/O error that outlasted the
@@ -1496,8 +1511,15 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
     if not repos:
         return Decision("allow", "outside_repository",
                         "no repository holds the target; the gate covers repositories")
+    budget_ends = time.monotonic() + JUDGMENT_BUDGET_SECONDS
     now = float(clock())
     task_type = infer_task_type(paths)
+
+    def out_of_time() -> Decision:
+        return Decision("deny", "gate_state_unavailable",
+                        "delegation-first gate: the routing judgment ran out of its time budget "
+                        "before the hook's own timeout; nothing is implemented until it can "
+                        "finish (retry the call)", repos)
 
     def overtaken(candidate: dict[str, Any]) -> bool:
         return receipt_overtaken(
@@ -1508,7 +1530,7 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
     def effective(repo: str) -> tuple[dict[str, Any] | None, bool]:
         """The receipt that governs this client here, and whether it lives in
         this client's own retain slot."""
-        shared = read_receipt(state_root, repo)
+        shared = read_receipt(state_root, repo, grace=False)
         if shared is not None and decide is not None and is_another_clients_retain(shared, client):
             # Another client kept its own work. That is not a claim on the
             # repository, so this client is governed by its own retain, made
@@ -1517,7 +1539,7 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
             # their retain is stale is theirs to find out. Judged here, a
             # different task type made each client re-decide the other's
             # receipt, and the two took turns replacing it.
-            own = read_receipt(state_root, repo, client)
+            own = read_receipt(state_root, repo, client, grace=False)
             if own is not None and overtaken(own):
                 own = None
             return own, True
@@ -1561,9 +1583,13 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
     def judge_held() -> Decision:
         governing: dict[str, dict[str, Any]] = {}
         for repo in repos:
+            if time.monotonic() >= budget_ends:
+                return out_of_time()
             try:
                 receipt, alongside = effective(repo)
                 if receipt is None and decide is not None:
+                    if time.monotonic() >= budget_ends:
+                        return out_of_time()
                     # No receipt yet: make the decision now rather than
                     # refusing and asking the agent to make it. This is the
                     # automatic part.
@@ -1633,7 +1659,7 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
         with contextlib.ExitStack() as held:
             # One budget for all of them, so nested repositories cannot stack
             # a full wait each against the hook's own timeout.
-            deadline = time.monotonic() + DECISION_LOCK_TIMEOUT_SECONDS
+            deadline = min(time.monotonic() + DECISION_LOCK_TIMEOUT_SECONDS, budget_ends)
             for repo in repos:
                 held.enter_context(decision_lock(state_root, repo,
                                                  timeout=deadline - time.monotonic()))
