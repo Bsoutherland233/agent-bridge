@@ -12,6 +12,7 @@ from .. import config, store as bridge_store
 from .storage import RoomStore
 from .dispatch import Dispatcher
 from .adapters import BridgeAdapter
+from .hermes import HermesAdapter
 from .rounds import PeerRounds
 from .policy import RoomPolicy, room_config
 from .server import create_server
@@ -26,7 +27,7 @@ def _local_opener():
     return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
 
-def build_app(root: Path, allow_client: bool = False):
+def build_app(root: Path, allow_client: bool = False, hermes_executable: Path | None = None):
     bridge_store.set_umask()
     root = Path(root).resolve()
     prepare_private_directory(root)
@@ -49,7 +50,12 @@ def build_app(root: Path, allow_client: bool = False):
         room_store.create_room('My agents')
     room_store.recover_interrupted()
     verify_private_directory(root)
-    adapters = {p: BridgeAdapter(cfg, p, root / 'canary-results.json') for p in participants}
+    adapters = {p: BridgeAdapter(cfg, p, root / 'canary-results.json') for p in ('claude', 'codex')}
+    if hermes_executable is not None:
+        hermes_executable = Path(hermes_executable).resolve(strict=True)
+        if not hermes_executable.is_file():
+            raise ValueError('Hermes executable must be a file')
+        adapters['hermes'] = HermesAdapter(hermes_executable, root / 'hermes', policy)
     dispatcher = Dispatcher(room_store, adapters)
     token = secrets.token_urlsafe(32)
     rounds = PeerRounds(room_store, adapters, policy)
@@ -63,6 +69,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='Local internal agent room')
     parser.add_argument('--open', action='store_true')
     parser.add_argument('--state-dir', type=Path, default=Path.home() / '.agent-bridge' / 'chat')
+    parser.add_argument('--hermes-executable', type=Path, help='Optional installed Hermes CLI; always uses its default profile')
     args = parser.parse_args(argv)
     root = args.state_dir.resolve()
     prepare_private_directory(root)
@@ -86,7 +93,7 @@ def main(argv=None):
             raise SystemExit('Another room instance is starting or not responding. Retry shortly.')
     server = dispatcher = None
     try:
-        server, _, dispatcher, token = build_app(root)
+        server, _, dispatcher, token = build_app(root, hermes_executable=args.hermes_executable)
         bridge_store.atomic_write_json(str(runtime_path), {'port': server.server_port, 'token': token})
         bridge_store.atomic_write_json(str(root / 'peer-runtime.json'), {'port': server.server_port, 'tokens': server.rounds_token, 'participants': list(server.peer_rounds.participants)})
         thread = threading.Thread(target=dispatcher.loop, daemon=True)

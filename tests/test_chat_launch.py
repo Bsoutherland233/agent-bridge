@@ -28,6 +28,13 @@ class LaunchTests(StorageTests):
             with self.assertRaises(ValueError):
                 adapter.start('large enough', 'synthetic')
         start.assert_not_called()
+
+    def test_explicit_hermes_path_registers_optional_adapter(self):
+        executable = Path(self.temp.name) / 'hermes.exe'
+        executable.write_bytes(b'fixture')
+        app = build_app(Path(self.temp.name) / 'hermes-state', hermes_executable=executable)
+        self.addCleanup(app[0].server_close)
+        self.assertEqual(set(app[2].adapters), {'claude', 'codex', 'hermes'})
     def test_existing_instance_probe_disables_proxy_and_redirects(self):
         with patch('agent_bridge.chat.__main__.urllib.request.build_opener') as build:
             _local_opener()

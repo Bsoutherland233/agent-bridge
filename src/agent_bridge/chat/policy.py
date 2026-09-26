@@ -31,8 +31,9 @@ class RoomPolicy:
             try:
                 self.cfg.peer(target)
             except (KeyError, ValueError):
-                raise ValueError('Unknown peer') from None
-        elif target not in ('claude', 'codex'):
+                if target != 'hermes':
+                    raise ValueError('Unknown peer') from None
+        elif target not in ('claude', 'codex', 'hermes'):
             raise ValueError('Unknown peer')
         if classification not in LABELS or classification not in self._allowed(target):
             raise ValueError('Room policy refuses this classification')

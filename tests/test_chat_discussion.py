@@ -43,5 +43,5 @@ class DiscussionTests(StorageTests):
         for _ in range(3): self.assertTrue(d.run_once())
         self.assertFalse(d.run_once())
         self.assertEqual([j['status'] for j in self.store.snapshot(self.room)['jobs']],['failed','completed','completed'])
-    def test_new_room_discussion_includes_both_providers(self):
-        self.assertEqual(set(self.store.preferences(self.room)['participants']), {'claude','codex'})
+    def test_new_room_discussion_includes_registered_providers(self):
+        self.assertEqual(set(self.store.preferences(self.room)['participants']), {'claude','codex','hermes'})
