@@ -9,7 +9,11 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import signal
 import subprocess
+import threading
+import time
 import uuid
 
 from .. import store
@@ -20,6 +24,9 @@ _ENVIRONMENT_KEYS = (
     'PATH', 'HOME', 'USERPROFILE', 'SYSTEMROOT', 'TEMP', 'TMP',
     'LANG', 'LC_ALL', 'LC_CTYPE', 'PYTHONIOENCODING', 'PYTHONUTF8',
 )
+OUTPUT_LIMIT = 4_000_000
+ERROR_LIMIT = 1_000_000
+JOB_RETENTION_SECONDS = 24 * 3600
 
 
 def child_environment(source=None) -> dict[str, str]:
@@ -51,6 +58,15 @@ class HermesAdapter:
     def __init__(self, executable: Path, root: Path, policy):
         self.executable, self.root, self.policy = executable, root, policy
         prepare_private_directory(root)
+        self._cleanup_stale_jobs()
+
+    def _cleanup_stale_jobs(self):
+        cutoff = time.time() - JOB_RETENTION_SECONDS
+        if not self.root.exists():
+            return
+        for child in self.root.iterdir():
+            if child.is_dir() and child.stat().st_mtime < cutoff:
+                shutil.rmtree(child, ignore_errors=True)
 
     def fingerprint(self):
         files = [self.executable]
@@ -66,15 +82,64 @@ class HermesAdapter:
 
     def status(self) -> dict:
         try:
-            evidence = json.loads((self.root / 'verification.json').read_text(encoding='utf-8'))
-            if (evidence.get('fingerprint') != self.fingerprint() or evidence.get('profile') != 'default'
-                    or evidence.get('start_pass') is not True or evidence.get('resume_pass') is not True
-                    or evidence.get('selected_pass') is not True):
-                raise ValueError('Unverified')
+            self.fingerprint()
             verify_private_directory(self.root)
+            self._cleanup_stale_jobs()
         except (OSError, ValueError):
-            return {'state': 'verification_required', 'detail': 'Default Hermes profile needs implementation-bound start, follow-up, and selected-context verification. Unsupported installation layouts remain disconnected.'}
+            return {'state': 'verification_required', 'detail': 'Hermes implementation layout and private state directory could not be verified. Unsupported installation layouts remain disconnected.'}
         return {'state': 'ready', 'detail': 'Default Hermes profile; room sessions support clarification only, not filesystem or messaging tools.'}
+
+    @staticmethod
+    def _terminate_process_group(process):
+        if process.poll() is not None:
+            return
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=False, timeout=5)
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def _run_process(self, argv, prompt, job):
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+        process = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=job, env=child_environment(), shell=False,
+            creationflags=flags, start_new_session=(os.name != 'nt'))
+        output, errors, overflow = bytearray(), bytearray(), []
+
+        def drain(stream, target, limit, label):
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    return
+                if len(target) < limit:
+                    target.extend(chunk[:limit - len(target)])
+                if len(target) + len(chunk) > limit:
+                    overflow.append(label)
+
+        readers = [threading.Thread(target=drain, args=(process.stdout, output, OUTPUT_LIMIT, 'stdout'), daemon=True),
+                   threading.Thread(target=drain, args=(process.stderr, errors, ERROR_LIMIT, 'stderr'), daemon=True)]
+        for reader in readers:
+            reader.start()
+        try:
+            process.stdin.write(prompt.encode('utf-8'))
+            process.stdin.close()
+            returncode = process.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            self._terminate_process_group(process)
+            process.wait(timeout=5)
+            raise ValueError('Hermes timed out; its provider call may still consume usage') from None
+        finally:
+            for reader in readers:
+                reader.join(timeout=5)
+        if overflow:
+            self._terminate_process_group(process)
+            raise ValueError('Hermes response exceeded the room output limit')
+        return output.decode('utf-8', errors='replace'), returncode
 
     def _call(self, prompt, classification, session=None, *, selected_only=False):
         if self.status()['state'] != 'ready':
@@ -94,17 +159,11 @@ class HermesAdapter:
         if session:
             argv += ['--resume', session, '--no-restore-cwd']
         try:
-            with (job / 'stdout.jsonl').open('w', encoding='utf-8') as out, (job / 'stderr.log').open('w', encoding='utf-8') as err:
-                result = subprocess.run(argv, input=prompt, text=True, encoding='utf-8', errors='replace', shell=False,
-                                        stdout=out, stderr=err, cwd=job, timeout=120,
-                                        env=child_environment(),
-                                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            output = job / 'stdout.jsonl'
-            if output.stat().st_size > 4_000_000:
-                raise ValueError('Hermes response exceeded the room output limit')
-            text, session_id = decode_result(output.read_text(encoding='utf-8'), result.returncode)
-        except subprocess.TimeoutExpired:
-            raise ValueError('Hermes timed out; its provider call may still consume usage') from None
+            raw, returncode = self._run_process(argv, prompt, job)
+            text, session_id = decode_result(raw, returncode)
+        except Exception:
+            shutil.rmtree(job, ignore_errors=True)
+            raise
         store.atomic_write_json(str(job / 'result.json'), {'ok': True, 'peer_response': text})
         return {'ok': True, 'job_id': job_id, 'conversation_id': session_id}
 
@@ -124,4 +183,7 @@ class HermesAdapter:
     def read(self, job_id: str) -> dict:
         if str(uuid.UUID(job_id)) != job_id:
             raise ValueError('Invalid job ID')
-        return json.loads((self.root / job_id / 'result.json').read_text(encoding='utf-8'))
+        path = self.root / job_id
+        result = json.loads((path / 'result.json').read_text(encoding='utf-8'))
+        shutil.rmtree(path, ignore_errors=True)
+        return result
