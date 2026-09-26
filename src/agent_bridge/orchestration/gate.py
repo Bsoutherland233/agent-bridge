@@ -557,8 +557,12 @@ def read_receipt(state_root: str, repo: str,
     path = receipt_path(state_root, repo, retained_by)
     try:
         loaded = store.read_json_atomic(path)
-    except OSError:
+    except FileNotFoundError:
         return None
+    # Any other OSError (a permission refusal or I/O error that outlasted the
+    # retry window) propagates. Read as "no receipt", it let the automatic
+    # decision replace a receipt nobody could read and then allow the call,
+    # which is fail-open. The gate turns it into gate_state_unavailable.
     if retained_by is not None and not (
             isinstance(loaded, dict) and loaded.get("retained_alongside") is True
             and loaded.get("automatic") is True and loaded.get("caller") == retained_by
@@ -1467,27 +1471,45 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
             lambda: autoroute.policy_fingerprint(state_root),
             None if capacity_db is None else lambda: capacity_digest(capacity_db, now))
 
-    def effective(repo: str, *, fresh: bool) -> tuple[dict[str, Any] | None, bool]:
+    def effective(repo: str) -> tuple[dict[str, Any] | None, bool]:
         """The receipt that governs this client here, and whether it lives in
-        this client's own retain slot. ``fresh`` skips the overtaken checks
-        for a receipt this call has just had written."""
+        this client's own retain slot."""
         shared = read_receipt(state_root, repo)
-        if shared is not None and decide is not None and not fresh and overtaken(shared):
+        if shared is not None and decide is not None and is_another_clients_retain(shared, client):
+            # Another client kept its own work. That is not a claim on the
+            # repository, so this client is governed by its own retain, made
+            # and re-made exactly like a shared one but never overwriting
+            # theirs. Checked before the overtaken rules on purpose: whether
+            # their retain is stale is theirs to find out. Judged here, a
+            # different task type made each client re-decide the other's
+            # receipt, and the two took turns replacing it.
+            own = read_receipt(state_root, repo, client)
+            if own is not None and overtaken(own):
+                own = None
+            return own, True
+        if shared is not None and decide is not None and overtaken(shared):
             shared = None
-        if shared is None or decide is None or not is_another_clients_retain(shared, client):
-            return shared, False
-        # Another client kept its own work. That is not a claim on the
-        # repository, so this client is governed by its own retain, made and
-        # re-made exactly like a shared one but never overwriting theirs.
-        own = read_receipt(state_root, repo, client)
-        if own is not None and not fresh and overtaken(own):
-            own = None
-        return own, True
+        return shared, False
+
+    def written(outcome: Any, repo: str) -> dict[str, Any] | None:
+        """The receipt the decision just wrote, when the decider reports it.
+
+        Re-reading instead can select a different receipt than the decision
+        made: a concurrent write by the other client can put a retain back in
+        the shared slot between the two, and the re-read then lands on this
+        client's old, overtaken slot and allows the call, even though the
+        decision just made routed this client's work away.
+        """
+        receipt = getattr(outcome, "receipt", None)
+        if not isinstance(receipt, dict) or receipt.get("repo") != repo_key(repo) \
+                or receipt.get("caller") != client:
+            return None
+        return receipt
 
     governing: dict[str, dict[str, Any]] = {}
     for repo in repos:
         try:
-            receipt, alongside = effective(repo, fresh=False)
+            receipt, alongside = effective(repo)
         except (OSError, ValueError) as exc:
             return Decision("deny", "gate_state_unavailable",
                             f"delegation-first gate: routing state could not be read "
@@ -1497,9 +1519,9 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
             # asking the agent to make it. This is the automatic part.
             try:
                 if alongside:
-                    decide(repo, task_type, retained_alongside=True)
+                    outcome = decide(repo, task_type, retained_alongside=True)
                 else:
-                    decide(repo, task_type)
+                    outcome = decide(repo, task_type)
             except Exception as exc:  # noqa: BLE001  fail closed, name the class
                 # AutoDecisionError carries a fixed reason code this codebase
                 # wrote, so it is safe to repeat. Any other class's text is
@@ -1512,7 +1534,13 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
                     f"delegation-first gate: the routing decision for {repo} could not be "
                     f"created ({detail}); nothing is implemented until it can be", repos)
             try:
-                receipt, _ = effective(repo, fresh=True)
+                receipt = written(outcome, repo)
+                if receipt is None:
+                    # A decider that does not report what it wrote (only a
+                    # test double does): read back, as before this change.
+                    receipt = read_receipt(state_root, repo)
+                    if receipt is not None and is_another_clients_retain(receipt, client):
+                        receipt = read_receipt(state_root, repo, client)
             except (OSError, ValueError) as exc:
                 return Decision("deny", "gate_state_unavailable",
                                 f"delegation-first gate: routing state could not be read "
