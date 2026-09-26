@@ -1649,5 +1649,197 @@ class ReviewFindingsFromTheOtherProvider(AutoCase):
         self.assertEqual(untouched["state"], "owned")
 
 
+class ARetainIsNotAClaimOnTheRepository(AutoCase):
+    """Reproduced 2026-09-24: a retain receipt denied the other assistant.
+
+    A retain decision means "the caller keeps its own work". Enforced as the
+    shared receipt it read as "this repository belongs to the caller", so the
+    second assistant was denied ``routed_elsewhere`` ("is routed to claude;
+    this client does not implement it") in every repository the policy
+    retains, until the receipt expired four hours later.
+    """
+
+    RETAINING_POLICIES = {
+        "no policy at all": {},
+        "local only": {"allowed_routes": ["local"]},
+        "both assistants, unclassified": {"allowed_routes": ["claude", "codex"]},
+    }
+
+    def decisions(self) -> list[dict]:
+        path = self.state / "routing" / gate.AUDIT_LEDGER
+        if not path.exists():
+            return []
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+        return [row for row in rows if row.get("event") == "routing_decided"]
+
+    def own_receipt(self, client: str) -> dict | None:
+        return gate.read_receipt(str(self.state), str(self.repo), client)
+
+    def arrange(self, entry: dict) -> None:
+        self.write_policy({str(self.repo): entry} if entry else {})
+        for route in ("claude", "codex", "local"):
+            self.observe(route)
+
+    def test_the_second_assistant_gets_its_own_retain_under_each_retaining_policy(self):
+        for label, entry in self.RETAINING_POLICIES.items():
+            for first, second in (("claude", "codex"), ("codex", "claude")):
+                with self.subTest(policy=label, first=first):
+                    self.setUp()
+                    self.arrange(entry)
+                    self.assertAllowed(self.hook(first, self.repo))
+                    shared = self.receipt_for(self.repo)
+                    self.assertTrue(shared["code"].startswith("retained_"), shared["code"])
+                    self.assertEqual(shared["owner_route"], first)
+
+                    self.assertAllowed(self.hook(second, self.repo))
+                    own = self.own_receipt(second)
+                    self.assertIsNotNone(own)
+                    self.assertTrue(own["code"].startswith("retained_"), own["code"])
+                    self.assertEqual(own["caller"], second)
+                    self.assertEqual(own["owner_route"], second)
+                    self.assertEqual(own["owner_id"], autodecide.owner_id_for(second))
+                    self.assertTrue(own["retained_alongside"])
+                    # The first assistant's decision is untouched, not overwritten.
+                    self.assertEqual(self.receipt_for(self.repo), shared)
+                    self.assertAllowed(self.hook(first, self.repo))
+
+    def test_the_two_retains_hold_different_stages(self):
+        """Stage ownership: neither edits under a lease the other holds."""
+        self.arrange({})
+        self.hook("claude", self.repo)
+        self.hook("codex", self.repo)
+        shared, own = self.receipt_for(self.repo), self.own_receipt("codex")
+        self.assertEqual(shared["item_id"], own["item_id"])
+        self.assertNotEqual(shared["stage"], own["stage"])
+        router = StageRouter(str(self.db))
+        self.assertEqual(router.get(own["item_id"], own["stage"])["owner_id"],
+                         autodecide.owner_id_for("codex"))
+        self.assertEqual(router.get(shared["item_id"], shared["stage"])["owner_id"],
+                         autodecide.owner_id_for("claude"))
+
+    def test_alternating_assistants_decide_once_each_and_then_never_again(self):
+        """No churn and no livelock: nobody re-decides the other's retain."""
+        self.arrange({})
+        outcomes = []
+        for _ in range(4):
+            outcomes.append(self.hook("claude", self.repo) == {})
+            outcomes.append(self.hook("codex", self.repo) == {})
+        self.assertEqual(outcomes, [True] * 8)
+        self.assertEqual([row["caller"] for row in self.decisions()], ["claude", "codex"])
+
+    def test_a_routed_away_decision_still_binds(self):
+        """The first client routed to its peer stays denied; the peer proceeds."""
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}})
+        self.observe("codex")
+        self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        self.assertAllowed(self.hook("codex", self.repo))
+        self.assertDenied(self.hook("claude", self.repo), "routed_elsewhere")
+        self.assertIsNone(self.own_receipt("claude"))
+        self.assertIsNone(self.own_receipt("codex"))
+
+    def test_a_decision_routing_away_replaces_the_other_retain_and_binds(self):
+        """The arriving client's own decision can route its work away. That is
+        written to the shared receipt, not beside it, and it binds."""
+        self.write_policy({str(self.repo): {
+            "classification": "internal_nonclient",
+            "allowed_routes": ["claude", "codex"]}}, prefer=["claude", "codex"])
+        self.observe("codex")
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["code"], "retained_is_the_policy")
+        # codex's own decision: both are eligible and claude is preferred, so
+        # codex's work goes to claude. That is a routing, not a retain.
+        self.assertDenied(self.hook("codex", self.repo), "routed_elsewhere")
+        shared = self.receipt_for(self.repo)
+        self.assertEqual((shared["caller"], shared["owner_route"], shared["code"]),
+                         ("codex", "claude", "routed_peer_implementation"))
+        self.assertIsNone(self.own_receipt("codex"))
+        self.assertAllowed(self.hook("claude", self.repo))
+        self.assertDenied(self.hook("codex", self.repo), "routed_elsewhere")
+
+    def test_a_manual_retain_still_binds_the_other_client(self):
+        """Only an automatic retain is read as the caller keeping its work."""
+        self.arrange({})
+        self.assertAllowed(self.hook("claude", self.repo))
+        shared = dict(self.receipt_for(self.repo))
+        shared.pop("automatic")
+        store_path = gate.receipt_path(str(self.state), str(self.repo))
+        Path(store_path).write_text(json.dumps(shared), encoding="utf-8")
+        self.assertDenied(self.hook("codex", self.repo), "routed_elsewhere")
+
+    def test_an_unreadable_own_slot_fails_closed(self):
+        self.arrange({})
+        self.hook("claude", self.repo)
+        self.hook("codex", self.repo)
+        Path(gate.receipt_path(str(self.state), str(self.repo), "codex")).write_text(
+            "{not json", encoding="utf-8")
+        self.assertDenied(self.hook("codex", self.repo), "gate_state_unavailable")
+        self.assertAllowed(self.hook("claude", self.repo))
+
+    def test_a_forged_own_slot_is_not_a_receipt(self):
+        """A routed-away document planted in the slot cannot bind or free anyone."""
+        self.arrange({})
+        self.hook("claude", self.repo)
+        self.hook("codex", self.repo)
+        path = Path(gate.receipt_path(str(self.state), str(self.repo), "codex"))
+        forged = json.loads(path.read_text(encoding="utf-8"))
+        forged.update(owner_route="local", decision="local", code="routed_local_mechanical")
+        path.write_text(json.dumps(forged), encoding="utf-8")
+        self.assertDenied(self.hook("codex", self.repo), "gate_state_unavailable")
+
+    def test_a_slot_document_copied_into_the_shared_receipt_is_refused(self):
+        self.arrange({})
+        self.hook("claude", self.repo)
+        self.hook("codex", self.repo)
+        own = Path(gate.receipt_path(str(self.state), str(self.repo), "codex"))
+        Path(gate.receipt_path(str(self.state), str(self.repo))).write_text(
+            own.read_text(encoding="utf-8"), encoding="utf-8")
+        self.assertDenied(self.hook("claude", self.repo), "gate_state_unavailable")
+
+    def test_an_unreadable_policy_still_fails_closed_for_the_arriving_client(self):
+        self.arrange({})
+        self.assertAllowed(self.hook("claude", self.repo))
+        Path(autoroute.policy_path(str(self.state))).write_text("{", encoding="utf-8")
+        # The policy fingerprint changed, so claude's retain is overtaken for
+        # both clients and the decision that follows cannot read the policy.
+        self.assertDenied(self.hook("codex", self.repo), "gate_auto_decision_failed")
+
+    def test_the_own_retain_is_re_made_when_it_is_overtaken(self):
+        """Made and re-made like a shared one: here, its stage completed."""
+        self.arrange({})
+        self.hook("claude", self.repo)
+        self.hook("codex", self.repo)
+        first = self.own_receipt("codex")
+        router = StageRouter(str(self.db))
+        current = router.get(first["item_id"], first["stage"])
+        router.complete(first["item_id"], first["stage"], owner_id=first["owner_id"],
+                        expected_revision=current["revision"])
+        self.assertAllowed(self.hook("codex", self.repo))
+        again = self.own_receipt("codex")
+        self.assertNotEqual(again["stage"], first["stage"])
+        self.assertEqual(self.receipt_for(self.repo)["caller"], "claude")
+
+    def test_the_other_retain_being_overtaken_lets_the_arrival_take_the_shared_slot(self):
+        self.arrange({})
+        self.hook("claude", self.repo)
+        # A policy change overtakes claude's retain, so it no longer governs
+        # anyone and codex decides into the shared slot as before.
+        self.write_policy({}, prefer=["codex"])
+        self.assertAllowed(self.hook("codex", self.repo))
+        self.assertEqual(self.receipt_for(self.repo)["caller"], "codex")
+        self.assertIsNone(self.own_receipt("codex"))
+
+    def test_the_retain_beside_another_leaves_the_intent_alone(self):
+        self.arrange({})
+        self.hook("claude", self.repo)
+        intent = Path(autodecide.intent_path(str(self.state), str(self.repo)))
+        intent.parent.mkdir(parents=True, exist_ok=True)
+        intent.write_text(json.dumps({"version": 1, "route": "local"}), encoding="utf-8")
+        self.assertAllowed(self.hook("codex", self.repo))
+        self.assertTrue(intent.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

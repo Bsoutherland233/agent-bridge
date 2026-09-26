@@ -385,16 +385,53 @@ def enclosing_repos(path: str) -> list[str]:
         current = parent
 
 
-def receipt_name(repo: str) -> str:
-    return hashlib.sha256(os.path.realpath(repo).encode("utf-8")).hexdigest()[:32] + ".json"
+def receipt_name(repo: str, retained_by: str | None = None) -> str:
+    """The receipt file for ``repo``: the shared one, or a client's own retain.
+
+    ``retained_by`` names the per-client slot described at
+    :func:`is_another_clients_retain`. It is a closed client name, never a
+    caller-supplied string, so it cannot steer the file name anywhere else.
+    """
+    stem = hashlib.sha256(os.path.realpath(repo).encode("utf-8")).hexdigest()[:32]
+    if retained_by is None:
+        return stem + ".json"
+    if retained_by not in CLIENTS:
+        raise RoutingError("caller_invalid")
+    return f"{stem}.retain-{retained_by}.json"
 
 
 def receipt_dir(state_root: str) -> str:
     return os.path.join(str(state_root), RECEIPT_DIR)
 
 
-def receipt_path(state_root: str, repo: str) -> str:
-    return os.path.join(receipt_dir(state_root), receipt_name(repo))
+def receipt_path(state_root: str, repo: str, retained_by: str | None = None) -> str:
+    return os.path.join(receipt_dir(state_root), receipt_name(repo, retained_by))
+
+
+def is_another_clients_retain(receipt: dict[str, Any], client: str) -> bool:
+    """Whether ``receipt`` is an automatic decision by *another* client to keep
+    its own work, which says nothing about who else may work in the repository.
+
+    A retain means "the caller keeps its work", not "this repository belongs
+    to the caller". Enforcing the shared receipt as if it were a claim denied
+    the second assistant ``routed_elsewhere`` in every repository the policy
+    retains -- unclassified, client-derived, or narrowed to a route neither
+    assistant can dispatch to -- for up to four hours. The second assistant
+    now gets its own retain decision, in its own slot, and the shared receipt
+    is left as it was: no rewrite, so the two clients do not take turns
+    overwriting one file on every call.
+
+    Deliberately narrow. A routed-away decision still binds everyone (it names
+    the route the work is owed to), and a hand-made receipt still binds
+    everyone (an operator chose it). Only an automatic, self-owned, retained
+    decision by a different caller qualifies.
+    """
+    return (bool(receipt.get("automatic"))
+            and receipt.get("decision") == "self"
+            and str(receipt.get("code", "")).startswith("retained_")
+            and receipt.get("caller") in CLIENTS
+            and receipt.get("caller") != client
+            and receipt.get("owner_route") == receipt.get("caller"))
 
 
 def route_decision(caller: str, owner_route: str) -> str:
@@ -411,8 +448,15 @@ def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any
                     considered: dict[str, Any] | None = None,
                     automatic: bool = False,
                     policy_fingerprint: str | None = None,
-                    capacity_fingerprint: str | None = None) -> dict[str, Any]:
+                    capacity_fingerprint: str | None = None,
+                    retained_alongside: bool = False) -> dict[str, Any]:
     """Write the receipt for an owned stage and return it.
+
+    ``retained_alongside`` writes an automatic retain to the caller's own slot
+    instead of the shared one, for a caller that arrived while another client's
+    automatic retain holds the shared slot (:func:`is_another_clients_retain`).
+    Only a retain may go there: a decision that routes work away always
+    replaces the shared receipt, because it binds everyone.
 
     ``stage_record`` is the router's current view of the stage, already
     checked by the caller for ownership at the expected revision; this
@@ -476,17 +520,28 @@ def record_decision(state_root: str, *, caller: str, stage_record: dict[str, Any
         receipt["policy_fingerprint"] = policy_fingerprint
     if capacity_fingerprint is not None:
         receipt["capacity_fingerprint"] = capacity_fingerprint
+    if retained_alongside:
+        if not automatic or receipt["decision"] != "self" \
+                or not str(code or "").startswith("retained_"):
+            raise RoutingError("retained_alongside_invalid")
+        receipt["retained_alongside"] = True
     # The audit line first: a receipt that exists is always accounted for,
     # while an audit line without a receipt is only a decision that failed
     # to take effect.
     store.append_ledger(os.path.join(receipt_dir(state_root), AUDIT_LEDGER),
                         {"event": "routing_decided", **receipt})
-    store.atomic_write_json(receipt_path(state_root, repo_root), receipt)
+    store.atomic_write_json(
+        receipt_path(state_root, repo_root, caller if retained_alongside else None), receipt)
     return receipt
 
 
-def read_receipt(state_root: str, repo: str) -> dict[str, Any] | None:
+def read_receipt(state_root: str, repo: str,
+                 retained_by: str | None = None) -> dict[str, Any] | None:
     """The receipt for ``repo`` or None; ValueError for one that is not a receipt.
+
+    ``retained_by`` reads that client's own retain slot rather than the shared
+    receipt. A document there must be exactly what ``record_decision`` puts
+    there -- that client's automatic retain -- or it is not a receipt.
 
     Reads through ``store.read_json_atomic`` rather than an ``os.path.exists``
     check followed by a separate open. ``atomic_write_json`` replaces this
@@ -499,11 +554,21 @@ def read_receipt(state_root: str, repo: str) -> dict[str, Any] | None:
     rather than letting an in-flight replace look like a caller-visible crash.
     A corrupt document still fails immediately: only ``OSError`` is retried.
     """
-    path = receipt_path(state_root, repo)
+    path = receipt_path(state_root, repo, retained_by)
     try:
         loaded = store.read_json_atomic(path)
     except OSError:
         return None
+    if retained_by is not None and not (
+            isinstance(loaded, dict) and loaded.get("retained_alongside") is True
+            and loaded.get("automatic") is True and loaded.get("caller") == retained_by
+            and loaded.get("owner_route") == retained_by and loaded.get("decision") == "self"
+            and str(loaded.get("code", "")).startswith("retained_")):
+        raise ValueError("routing receipt is not one this gate wrote")
+    if retained_by is None and isinstance(loaded, dict) and "retained_alongside" in loaded:
+        # A per-client retain copied into the shared slot would bind the other
+        # client again, which is the defect the slot exists to remove.
+        raise ValueError("routing receipt is not one this gate wrote")
     valid_until = loaded.get("valid_until") if isinstance(loaded, dict) else None
     if not isinstance(loaded, dict) or loaded.get("version") != RECEIPT_VERSION \
             or not isinstance(valid_until, (int, float)) or isinstance(valid_until, bool) \
@@ -1394,25 +1459,47 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
         return Decision("allow", "outside_repository",
                         "no repository holds the target; the gate covers repositories")
     now = float(clock())
+    task_type = infer_task_type(paths)
+
+    def overtaken(candidate: dict[str, Any]) -> bool:
+        return receipt_overtaken(
+            candidate, now, capacity_db, task_type,
+            lambda: autoroute.policy_fingerprint(state_root),
+            None if capacity_db is None else lambda: capacity_digest(capacity_db, now))
+
+    def effective(repo: str, *, fresh: bool) -> tuple[dict[str, Any] | None, bool]:
+        """The receipt that governs this client here, and whether it lives in
+        this client's own retain slot. ``fresh`` skips the overtaken checks
+        for a receipt this call has just had written."""
+        shared = read_receipt(state_root, repo)
+        if shared is not None and decide is not None and not fresh and overtaken(shared):
+            shared = None
+        if shared is None or decide is None or not is_another_clients_retain(shared, client):
+            return shared, False
+        # Another client kept its own work. That is not a claim on the
+        # repository, so this client is governed by its own retain, made and
+        # re-made exactly like a shared one but never overwriting theirs.
+        own = read_receipt(state_root, repo, client)
+        if own is not None and not fresh and overtaken(own):
+            own = None
+        return own, True
+
+    governing: dict[str, dict[str, Any]] = {}
     for repo in repos:
         try:
-            receipt = read_receipt(state_root, repo)
+            receipt, alongside = effective(repo, fresh=False)
         except (OSError, ValueError) as exc:
             return Decision("deny", "gate_state_unavailable",
                             f"delegation-first gate: routing state could not be read "
                             f"({type(exc).__name__}); nothing is implemented until it can", repos)
-        task_type = infer_task_type(paths)
-        if receipt is not None and decide is not None and receipt_overtaken(
-                receipt, now, capacity_db, task_type,
-                lambda: autoroute.policy_fingerprint(state_root),
-                None if capacity_db is None
-                else lambda: capacity_digest(capacity_db, now)):
-            receipt = None
         if receipt is None and decide is not None:
             # No receipt yet: make the decision now rather than refusing and
             # asking the agent to make it. This is the automatic part.
             try:
-                decide(repo, task_type)
+                if alongside:
+                    decide(repo, task_type, retained_alongside=True)
+                else:
+                    decide(repo, task_type)
             except Exception as exc:  # noqa: BLE001  fail closed, name the class
                 # AutoDecisionError carries a fixed reason code this codebase
                 # wrote, so it is safe to repeat. Any other class's text is
@@ -1425,7 +1512,7 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
                     f"delegation-first gate: the routing decision for {repo} could not be "
                     f"created ({detail}); nothing is implemented until it can be", repos)
             try:
-                receipt = read_receipt(state_root, repo)
+                receipt, _ = effective(repo, fresh=True)
             except (OSError, ValueError) as exc:
                 return Decision("deny", "gate_state_unavailable",
                                 f"delegation-first gate: routing state could not be read "
@@ -1469,7 +1556,8 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
                     f"{receipt.get('item_id')}/{receipt.get('stage')}, but the stage router no longer "
                     f"shows it owned by {receipt.get('owner_id')} on route {receipt.get('owner_route')} "
                     f"({stale}). Claim or renew the stage, then call routing_decide again.", repos, receipt)
-    receipt = read_receipt(state_root, repos[0])
+        governing[repo] = receipt
+    receipt = governing[repos[0]]
     return Decision("allow", "routing_receipt_valid",
                     f"stage {receipt.get('item_id')}/{receipt.get('stage')} is owned by this route",
                     repos, receipt)
@@ -1648,12 +1736,13 @@ def automatic_decider(client: str, state_root: str, capacity_db: str,
     Imported lazily so ``gate`` stays importable without the stage router and
     so the two modules do not import each other at module scope.
     """
-    def decide(repo: str, task_type: str) -> Any:
+    def decide(repo: str, task_type: str, *, retained_alongside: bool = False) -> Any:
         from .autodecide import ensure_decision
 
         return ensure_decision(client=client, repo=repo, state_root=state_root,
                                capacity_db=capacity_db, task_type=task_type,
-                               local_queue_root=local_queue_root or None)
+                               local_queue_root=local_queue_root or None,
+                               retained_alongside=retained_alongside)
     return decide
 
 
