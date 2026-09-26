@@ -4237,9 +4237,15 @@ def test_reported_issues() -> None:
           and "os.makedirs(codex_home" not in source
           and "os.mkdir(codex_home" not in source)
     if os.path.isdir(real_home):
-        check("I2: the isolated home is owner-only",
-              (os.stat(real_home).st_mode & 0o777) == 0o700,
-              oct(os.stat(real_home).st_mode & 0o777))
+        if os.name == "nt":
+            # Windows chmod/stat do not describe access control. Inspect the
+            # native descriptor without repairing it as part of the assertion.
+            verified, evidence = active_platform.observe_owner_only_acl(real_home)
+            check("I2: the isolated home is owner-only", verified, json.dumps(evidence))
+        else:
+            check("I2: the isolated home is owner-only",
+                  (os.stat(real_home).st_mode & 0o777) == 0o700,
+                  oct(os.stat(real_home).st_mode & 0o777))
 
     # I3: a null model in the ledger must be distinguishable from a read failure.
     for label, envelope_bits, expect in (
