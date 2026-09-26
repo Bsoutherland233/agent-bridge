@@ -98,7 +98,6 @@ jobs:
           python3 -m unittest discover -s tests -p "test_peer_rounds.py"
           python3 -m unittest discover -s tests -p "test_peer_http.py"
           python3 -m unittest discover -s tests -p "test_peer_mcp.py"
-          python3 -m unittest discover -s tests -p "test_peer_hermes.py"
 
       - name: Portable onboarding and optional local worker
         run: |

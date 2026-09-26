@@ -28,7 +28,7 @@ def _local_opener():
     return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
 
-def build_app(root: Path, allow_client: bool = False, hermes_executable: Path | None = None):
+def build_app(root: Path, allow_client: bool = False, hermes_executable: Path | None = None, grok_state_dir: Path | None = None):
     bridge_store.set_umask()
     root = Path(root).resolve()
     prepare_private_directory(root)
@@ -55,7 +55,12 @@ def build_app(root: Path, allow_client: bool = False, hermes_executable: Path | 
         adapters['hermes'] = HermesAdapter(hermes_executable, root / 'hermes', policy)
         if adapters['hermes'].status().get('state') == 'ready':
             participants.append('hermes')
-    adapters['grok'] = GrokAdapter(root / 'grok', policy)
+    if grok_state_dir is not None:
+        adapters['grok'] = GrokAdapter(Path(grok_state_dir).resolve(), policy)
+        if adapters['grok'].status().get('state') == 'ready':
+            participants.append('grok')
+    elif 'grok' in adapters:
+        del adapters['grok']
     room_store = RoomStore(root / 'chat.sqlite', max_chars=min(12000, cfg.prompt_budget('start') - 2000), participants=tuple(participants))
     if not room_store.rooms():
         room_store.create_room('My agents')
@@ -75,6 +80,7 @@ def main(argv=None):
     parser.add_argument('--open', action='store_true')
     parser.add_argument('--state-dir', type=Path, default=Path.home() / '.agent-bridge' / 'chat')
     parser.add_argument('--hermes-executable', type=Path, help='Optional installed Hermes CLI; always uses its default profile')
+    parser.add_argument('--grok-state-dir', type=Path, help='Opt in to the existing Grok Bot queue at this private state directory')
     args = parser.parse_args(argv)
     root = args.state_dir.resolve()
     prepare_private_directory(root)
@@ -98,7 +104,7 @@ def main(argv=None):
             raise SystemExit('Another room instance is starting or not responding. Retry shortly.')
     server = dispatcher = None
     try:
-        server, _, dispatcher, token = build_app(root, hermes_executable=args.hermes_executable)
+        server, _, dispatcher, token = build_app(root, hermes_executable=args.hermes_executable, grok_state_dir=args.grok_state_dir)
         bridge_store.atomic_write_json(str(runtime_path), {'port': server.server_port, 'token': token})
         bridge_store.atomic_write_json(str(root / 'peer-runtime.json'), {'port': server.server_port, 'tokens': server.rounds_token, 'participants': list(server.peer_rounds.participants)})
         thread = threading.Thread(target=dispatcher.loop, daemon=True)
