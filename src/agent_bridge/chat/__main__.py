@@ -13,6 +13,7 @@ from .storage import RoomStore
 from .dispatch import Dispatcher
 from .adapters import BridgeAdapter
 from .hermes import HermesAdapter
+from .grok import GrokAdapter
 from .rounds import PeerRounds
 from .policy import RoomPolicy, room_config
 from .server import create_server
@@ -54,6 +55,7 @@ def build_app(root: Path, allow_client: bool = False, hermes_executable: Path | 
         adapters['hermes'] = HermesAdapter(hermes_executable, root / 'hermes', policy)
         if adapters['hermes'].status().get('state') == 'ready':
             participants.append('hermes')
+    adapters['grok'] = GrokAdapter(root / 'grok', policy)
     room_store = RoomStore(root / 'chat.sqlite', max_chars=min(12000, cfg.prompt_budget('start') - 2000), participants=tuple(participants))
     if not room_store.rooms():
         room_store.create_room('My agents')

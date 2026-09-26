@@ -1,0 +1,119 @@
+"""Queue bridge for an existing Grok Bot's approved local computer tool.
+
+This module neither logs into Grok nor impersonates a model response. The
+operator's local Bot must claim one queued job and explicitly save one reply.
+No subprocess is launched, so no provider environment is inherited here.
+"""
+import json
+import time
+import uuid
+from pathlib import Path
+
+from .. import store
+from .hermes import child_environment
+from .windows_security import prepare_private_directory, verify_private_directory
+
+
+def job_path(root, job_id):
+    if str(uuid.UUID(job_id)) != job_id:
+        raise ValueError('Invalid job ID')
+    return Path(root) / (job_id + '.json')
+
+
+class GrokAdapter:
+    timeout = 150
+
+    def __init__(self, root: Path, policy):
+        self.root, self.policy = root, policy
+        self.environment = child_environment()
+        prepare_private_directory(root)
+        with store.file_lock(str(root / 'queue.lock')):
+            for path in root.glob('*.json'):
+                if path.name == 'heartbeat.json':
+                    continue
+                record = json.loads(path.read_text(encoding='utf-8'))
+                if record.get('status') in ('queued', 'running'):
+                    record['status'] = 'cancelled'
+                    store.atomic_write_json(str(path), record)
+
+    def status(self):
+        try:
+            heartbeat = json.loads((self.root / 'heartbeat.json').read_text(encoding='utf-8'))
+            if not 0 <= time.time() - heartbeat['at'] < 90:
+                raise ValueError('Stale')
+            verify_private_directory(self.root)
+        except (OSError, ValueError, KeyError, TypeError):
+            return {'state': 'connection_required', 'detail': 'Open your existing Grok Bot and give it the local connection prompt in docs/GROK-ROOM-SETUP.md. No Grok session is attached yet.'}
+        return {'state': 'ready', 'detail': 'A local command client checked in within 90 seconds. An active listener is still required; this does not verify Bot identity or always-on availability.'}
+
+    def start(self, prompt, classification):
+        return self.continue_(str(uuid.uuid4()), 'Fresh room consultation: base this answer on the supplied room history, not earlier Bot conversations. This request does not erase your underlying Bot memory.\n' + prompt, classification)
+
+    def continue_(self, conversation_id, prompt, classification):
+        if self.status()['state'] != 'ready':
+            raise ValueError('Grok Bot is not listening. Run its local connection command first.')
+        self.policy.authorize('grok', classification)
+        if not isinstance(prompt, str) or not 0 < len(prompt) <= 32000:
+            raise ValueError('Grok room context exceeds its limit')
+        job_id = str(uuid.uuid4())
+        record = {'job_id': job_id, 'conversation_id': conversation_id, 'prompt': prompt,
+                  'classification': classification, 'status': 'queued', 'expires': time.time() + 120}
+        store.atomic_write_json(str(job_path(self.root, job_id)), record)
+        return {'ok': True, 'job_id': job_id, 'conversation_id': conversation_id}
+
+    def poll(self, job_id):
+        record = json.loads(job_path(self.root, job_id).read_text(encoding='utf-8'))
+        status = record['status']
+        if status in ('queued', 'running') and time.time() >= record['expires']:
+            status = 'timed_out'
+        return {'ok': True, 'status': status}
+
+    def read(self, job_id):
+        record = json.loads(job_path(self.root, job_id).read_text(encoding='utf-8'))
+        if record['status'] != 'complete':
+            return {'ok': False, 'error_hint': 'Grok did not respond in time. Reconnect the Bot and request a new reply.'}
+        return {'ok': True, 'peer_response': record['text']}
+
+    def cancel(self, job_id):
+        with store.file_lock(str(self.root / 'queue.lock')):
+            path = job_path(self.root, job_id)
+            record = json.loads(path.read_text(encoding='utf-8'))
+            if record['status'] in ('queued', 'running'):
+                record['status'] = 'cancelled'
+                store.atomic_write_json(str(path), record)
+
+
+def receive(root: Path, wait: int = 45):
+    prepare_private_directory(root)
+    deadline = time.monotonic() + max(0, min(wait, 45))
+    while True:
+        store.atomic_write_json(str(root / 'heartbeat.json'), {'at': time.time()})
+        with store.file_lock(str(root / 'queue.lock')):
+            for path in sorted(root.glob('*.json'), key=lambda p: p.stat().st_mtime):
+                if path.name == 'heartbeat.json':
+                    continue
+                record = json.loads(path.read_text(encoding='utf-8'))
+                if record.get('status') != 'queued' or record['expires'] <= time.time():
+                    continue
+                record['status'] = 'running'
+                store.atomic_write_json(str(path), record)
+                return record
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.5)
+
+
+def respond(root: Path, job_id: str, text: str):
+    if not isinstance(text, str) or not 0 < len(text.strip()) <= 100000:
+        raise ValueError('Reply must contain 1–100000 characters')
+    verify_private_directory(root)
+    with store.file_lock(str(root / 'queue.lock')):
+        path = job_path(root, job_id)
+        try:
+            record = json.loads(path.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            raise ValueError('Unknown request') from None
+        if record['status'] != 'running' or record['expires'] <= time.time():
+            raise ValueError('Request is expired, stopped, or already answered')
+        record.update(status='complete', text=text)
+        store.atomic_write_json(str(path), record)
