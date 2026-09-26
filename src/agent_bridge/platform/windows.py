@@ -372,8 +372,11 @@ class WindowsPlatform:
             # with a PermissionError on the first contended use.
             try:
                 os.write(fd, b"\0")
-            except OSError:
-                pass
+            except PermissionError as exc:
+                # ERROR_LOCK_VIOLATION (33) only; anything else is a real
+                # failure and propagates.
+                if getattr(exc, "winerror", None) != 33:
+                    raise
         while True:
             try:
                 os.lseek(fd, 0, os.SEEK_SET)

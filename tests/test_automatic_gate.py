@@ -2043,6 +2043,42 @@ class ARetainIsNotAClaimOnTheRepository(AutoCase):
                          ("deny", "gate_state_unavailable"))
         self.assertIsNone(self.receipt_for(self.repo))
 
+    def test_the_hook_process_denies_on_its_watchdog_when_the_judgment_is_stuck(self):
+        """The hard bound, end to end in a real hook process: the judgment is
+        stuck (here, waiting on a lock the test holds), and the watchdog
+        writes a deny and exits before the host could time the hook out."""
+        self.arrange({})
+        payload = {"hook_event_name": "PreToolUse", "tool_name": "Edit",
+                   "tool_input": {"file_path": str(self.repo / "app.py")}, "cwd": str(self.repo)}
+        env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), gate.HOOK_WATCHDOG_ENV: "0.5"}
+        with gate.decision_lock(str(self.state), str(self.repo)):
+            started = time.monotonic()
+            completed = subprocess.run(
+                [sys.executable, "-P", "-m", "agent_bridge.orchestration.gate",
+                 "--client", "claude", "--config", str(self.config)],
+                input=json.dumps(payload).encode("utf-8"), capture_output=True,
+                timeout=60, env=env)
+            elapsed = time.monotonic() - started
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        out = json.loads(completed.stdout)
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertTrue(reason.endswith("[gate_timeout]"), reason)
+        self.assertEqual(completed.stdout.count(b"hookSpecificOutput"), 1)
+        self.assertLess(elapsed, gate.DECISION_LOCK_TIMEOUT_SECONDS,
+                        "the deny waited for the lock timeout, not the watchdog")
+
+    def test_the_watchdog_can_only_be_lowered(self):
+        from unittest import mock
+
+        for value, expected in (("0.5", 0.5), ("60", gate.HOOK_WATCHDOG_SECONDS),
+                                ("nan", gate.HOOK_WATCHDOG_SECONDS),
+                                ("-1", gate.HOOK_WATCHDOG_SECONDS),
+                                ("x", gate.HOOK_WATCHDOG_SECONDS)):
+            with self.subTest(value=value), \
+                    mock.patch.dict(os.environ, {gate.HOOK_WATCHDOG_ENV: value}):
+                self.assertEqual(gate._watchdog_seconds(), expected)
+
     def test_a_deeply_nested_routed_away_deny_arrives_well_inside_the_budget(self):
         """Measured on the previous design: five nested repositories, first
         decision, routed-away innermost, 10.3 s -- past the 10 s hook timeout,

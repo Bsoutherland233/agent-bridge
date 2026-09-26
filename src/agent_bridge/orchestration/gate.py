@@ -58,6 +58,7 @@ import shlex
 import sqlite3
 import stat
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
@@ -426,6 +427,64 @@ JUDGMENT_BUDGET_SECONDS = 7.0
 #: left. A holder that keeps them longer produces this gate's fail-closed
 #: deny rather than a host timeout.
 DECISION_LOCK_TIMEOUT_SECONDS = 3.0
+#: The hard bound. ``JUDGMENT_BUDGET_SECONDS`` only decides whether to start
+#: more work; a decision already running (SQLite waits, a slow disk) can
+#: still overrun it. So the hook process also arms a watchdog that, if no
+#: decision has been written by this many seconds after the hook started,
+#: writes a deny itself and exits. Below the hook entry's 10 s timeout with
+#: room for interpreter start-up, so the host always reads a decision.
+HOOK_WATCHDOG_SECONDS = 8.0
+#: May only lower the watchdog (tests use it); a value that would raise it,
+#: or one that does not parse, is ignored.
+HOOK_WATCHDOG_ENV = "AGENT_BRIDGE_GATE_WATCHDOG_SECONDS"
+
+
+class _SingleDecision:
+    """Write exactly one hook decision to stdout, from whichever of the main
+    judgment and the watchdog gets there first."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._written = False
+
+    def emit(self, text: str) -> bool:
+        with self._lock:
+            if self._written:
+                return False
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            self._written = True
+            return True
+
+
+def _watchdog_seconds() -> float:
+    try:
+        requested = float(os.environ.get(HOOK_WATCHDOG_ENV, ""))
+    except ValueError:
+        return HOOK_WATCHDOG_SECONDS
+    if not math.isfinite(requested) or requested <= 0:
+        return HOOK_WATCHDOG_SECONDS
+    return min(requested, HOOK_WATCHDOG_SECONDS)
+
+
+def _arm_watchdog(out: _SingleDecision) -> threading.Timer:
+    deny = json.dumps(hook_output(Decision(
+        "deny", "gate_timeout",
+        "delegation-first gate: the routing judgment did not finish in time; it is denied "
+        "rather than left to the host's timeout, which would run the tool (retry the call)")),
+        sort_keys=True) + "\n"
+
+    def fire() -> None:
+        if out.emit(deny):
+            # The decision is on stdout. Exit now so nothing the stuck
+            # judgment does later can reach the host; the kernel releases the
+            # decision locks with the process.
+            os._exit(0)
+
+    timer = threading.Timer(_watchdog_seconds(), fire)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 @contextlib.contextmanager
@@ -2749,6 +2808,8 @@ def main(argv: list[str] | None = None) -> int:
     # a deny whatever went wrong on the way to it.
     state_root = None
     updated_input = None
+    out = _SingleDecision()
+    watchdog = _arm_watchdog(out)
     try:
         if not args.client:
             raise ValueError("--client is required in hook mode")
@@ -2787,7 +2848,8 @@ def main(argv: list[str] | None = None) -> int:
                 record_event(state_root, args.client or "unknown", "unknown", decision)
             except Exception:  # noqa: BLE001  the deny stands whether or not it could be logged
                 pass
-    sys.stdout.write(json.dumps(hook_output(decision, updated_input), sort_keys=True) + "\n")
+    if out.emit(json.dumps(hook_output(decision, updated_input), sort_keys=True) + "\n"):
+        watchdog.cancel()
     return 0
 
 
