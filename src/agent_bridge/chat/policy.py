@@ -28,10 +28,10 @@ class RoomPolicy:
 
     def authorize(self, target: str, classification: str) -> None:
         if self.cfg is not None:
-            try:
-                self.cfg.peer(target)
-            except (KeyError, ValueError):
-                if target != 'hermes':
+            if target != 'hermes':
+                try:
+                    self.cfg.peer(target)
+                except (KeyError, ValueError):
                     raise ValueError('Unknown peer') from None
         elif target not in ('claude', 'codex', 'hermes'):
             raise ValueError('Unknown peer')

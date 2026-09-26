@@ -50,16 +50,18 @@ def build_app(root: Path, allow_client: bool = False, hermes_executable: Path | 
         room_store.create_room('My agents')
     room_store.recover_interrupted()
     verify_private_directory(root)
-    adapters = {p: BridgeAdapter(cfg, p, root / 'canary-results.json') for p in ('claude', 'codex')}
+    adapters = {p: BridgeAdapter(cfg, p, root / 'canary-results.json') for p in participants}
     if hermes_executable is not None:
         hermes_executable = Path(hermes_executable).resolve(strict=True)
         if not hermes_executable.is_file():
             raise ValueError('Hermes executable must be a file')
         adapters['hermes'] = HermesAdapter(hermes_executable, root / 'hermes', policy)
+        participants.append('hermes')
+        room_store.participants = tuple(participants)
     dispatcher = Dispatcher(room_store, adapters)
     token = secrets.token_urlsafe(32)
     rounds = PeerRounds(room_store, adapters, policy)
-    rounds_token = {caller: secrets.token_urlsafe(32) for caller in participants}
+    rounds_token = {caller: secrets.token_urlsafe(32) for caller in adapters}
     server = create_server(room_store, dispatcher, token, policy=policy, rounds=rounds, rounds_token=rounds_token)
     server.peer_rounds, server.rounds_token = rounds, rounds_token
     return server, room_store, dispatcher, token
