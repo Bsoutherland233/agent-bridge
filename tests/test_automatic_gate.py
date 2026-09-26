@@ -1939,6 +1939,68 @@ class ARetainIsNotAClaimOnTheRepository(AutoCase):
         self.assertEqual(decision.permission, "allow")
         self.assertEqual(len(self.decisions()), before + 1, "the gate decided a second time")
 
+    def test_even_an_existing_receipt_is_read_under_the_lock(self):
+        """Codex's round-four finding 1: no unlocked fast path. While a writer
+        holds the lock, a client with a valid receipt waits rather than
+        allowing from a receipt the writer may be replacing."""
+        from unittest import mock
+
+        self.arrange({})
+        self.hook("claude", self.repo)
+        self.hook("codex", self.repo)
+        self.assertEqual(self.judge_in_process("codex").permission, "allow")
+        with mock.patch.object(gate, "DECISION_LOCK_TIMEOUT_SECONDS", 0.2), \
+                gate.decision_lock(str(self.state), str(self.repo)):
+            decision = self.judge_in_process("codex")
+        self.assertEqual((decision.permission, decision.code),
+                         ("deny", "gate_state_unavailable"))
+
+    def test_nested_repositories_are_judged_under_all_their_locks(self):
+        """Codex's round-four finding 2: an outer and an inner receipt are read
+        as one state, so an edit in the inner repository waits for a writer
+        holding only the outer repository's lock."""
+        from unittest import mock
+
+        inner = git_repo(self.repo / "inner")
+        self.arrange({})
+        self.assertAllowed(self.hook("codex", inner, "mod.py"))
+        patch = ("*** Begin Patch\n*** Update File: mod.py\n@@\n-x = 1\n+x = 2\n"
+                 "*** End Patch\n")
+
+        def judge_inner():
+            return gate.judge("codex", "apply_patch", {"input": patch}, str(inner),
+                              state_root=str(self.state), capacity_db=str(self.db),
+                              decide=gate.automatic_decider("codex", str(self.state),
+                                                            str(self.db)))
+
+        self.assertEqual(judge_inner().permission, "allow")
+        with mock.patch.object(gate, "DECISION_LOCK_TIMEOUT_SECONDS", 0.2), \
+                gate.decision_lock(str(self.state), str(self.repo)):
+            decision = judge_inner()
+        self.assertEqual((decision.permission, decision.code),
+                         ("deny", "gate_state_unavailable"))
+
+    def test_nested_locks_share_one_wait_budget(self):
+        """Two enclosing repositories must not stack two full waits against
+        the hook's own timeout."""
+        from unittest import mock
+
+        inner = git_repo(self.repo / "inner")
+        self.arrange({})
+        self.hook("codex", inner, "mod.py")
+        patch = ("*** Begin Patch\n*** Update File: mod.py\n@@\n-x = 1\n+x = 2\n"
+                 "*** End Patch\n")
+        with mock.patch.object(gate, "DECISION_LOCK_TIMEOUT_SECONDS", 0.5), \
+                gate.decision_lock(str(self.state), str(inner)):
+            started = time.monotonic()
+            decision = gate.judge("codex", "apply_patch", {"input": patch}, str(inner),
+                                  state_root=str(self.state), capacity_db=str(self.db),
+                                  decide=gate.automatic_decider("codex", str(self.state),
+                                                                str(self.db)))
+            waited = time.monotonic() - started
+        self.assertEqual(decision.code, "gate_state_unavailable")
+        self.assertLess(waited, 0.9, "each repository waited a full budget of its own")
+
     def test_routing_decide_takes_the_same_lock(self):
         """The hand-made writer is serialised with the gate too."""
         from unittest import mock

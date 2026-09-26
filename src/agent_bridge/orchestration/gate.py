@@ -419,7 +419,7 @@ DECISION_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 @contextlib.contextmanager
-def decision_lock(state_root: str, repo: str) -> Iterator[None]:
+def decision_lock(state_root: str, repo: str, timeout: float | None = None) -> Iterator[None]:
     """Serialise every write of one repository's routing receipts.
 
     Held by the gate across resolve, decide and read (see
@@ -437,7 +437,8 @@ def decision_lock(state_root: str, repo: str) -> Iterator[None]:
         return
     stem = receipt_name(root)[:-len(".json")]
     path = os.path.join(receipt_dir(state_root), LOCK_DIR, stem + ".lock")
-    with store.file_lock(path, timeout=DECISION_LOCK_TIMEOUT_SECONDS):
+    wait = DECISION_LOCK_TIMEOUT_SECONDS if timeout is None else max(0.0, timeout)
+    with store.file_lock(path, timeout=wait):
         yield
 
 
@@ -1532,115 +1533,120 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
             return None
         return receipt
 
-    def decide_under_lock(repo: str) -> tuple[dict[str, Any] | None, Decision | None]:
-        """Resolve again, decide if still needed, and take what was written,
-        all while holding the repository's decision lock.
-
-        The lock is what makes the result exact. Without it the gate decided,
-        then re-read, and every write another process could make in between
-        -- the other client's retain, a routed-away or manual receipt, this
-        client's own delayed decision -- was a different way for the re-read
-        to land on a receipt the decision had not made. Patching each ordering
-        found the next one. Every writer of a routing receipt now takes this
-        lock (``record_decision`` callers here and in ``routing_decide``), so
-        nothing is written between this call's resolve and its read.
-
-        Resolving again first is the double check: another process may have
-        made the decision while this one waited, and deciding twice would
-        only write a second audit line for the same answer.
-        """
-        nonlocal now
-        with decision_lock(state_root, repo):
-            # The wait for the lock can be long enough to matter: a decision
-            # another process made meanwhile carries capacity observed after
-            # the ``now`` this call started with, and judged against that
-            # older instant it read as overtaken and was made again.
-            now = float(clock())
-            receipt, alongside = effective(repo)
-            if receipt is not None:
-                return receipt, None
-            try:
-                if alongside:
-                    outcome = decide(repo, task_type, retained_alongside=True)
-                else:
-                    outcome = decide(repo, task_type)
-            except Exception as exc:  # noqa: BLE001  fail closed, name the class
-                # AutoDecisionError carries a fixed reason code this codebase
-                # wrote, so it is safe to repeat. Any other class's text is
-                # unvetted and is left out, the same rule ``errors.py`` applies
-                # to every caller-visible field.
-                named = getattr(exc, "args", ()) and type(exc).__name__ == "AutoDecisionError"
-                detail = f"{type(exc).__name__}: {exc}" if named else type(exc).__name__
-                return None, Decision(
-                    "deny", "gate_auto_decision_failed",
-                    f"delegation-first gate: the routing decision for {repo} could not be "
-                    f"created ({detail}); nothing is implemented until it can be", repos)
-            receipt = written(outcome, repo)
-            if receipt is None:
-                # A decider that does not report what it wrote (only a test
-                # double does): resolve again, overtaken rules and all.
-                receipt, _ = effective(repo)
-            return receipt, None
-
-    governing: dict[str, dict[str, Any]] = {}
-    for repo in repos:
+    def decide_now(repo: str, alongside: bool) -> tuple[dict[str, Any] | None, Decision | None]:
+        """Make the missing decision and take up exactly what it wrote."""
         try:
-            receipt, _ = effective(repo)
-            failure = None
-            if receipt is None and decide is not None:
-                # No receipt yet: make the decision now rather than refusing
-                # and asking the agent to make it. This is the automatic part.
-                receipt, failure = decide_under_lock(repo)
-        except (OSError, ValueError) as exc:
-            # TimeoutError (the decision lock) is an OSError: fail closed.
-            return Decision("deny", "gate_state_unavailable",
-                            f"delegation-first gate: routing state could not be read "
-                            f"({type(exc).__name__}); nothing is implemented until it can", repos)
-        if failure is not None:
-            return failure
+            if alongside:
+                outcome = decide(repo, task_type, retained_alongside=True)
+            else:
+                outcome = decide(repo, task_type)
+        except Exception as exc:  # noqa: BLE001  fail closed, name the class
+            # AutoDecisionError carries a fixed reason code this codebase
+            # wrote, so it is safe to repeat. Any other class's text is
+            # unvetted and is left out, the same rule ``errors.py`` applies
+            # to every caller-visible field.
+            named = getattr(exc, "args", ()) and type(exc).__name__ == "AutoDecisionError"
+            detail = f"{type(exc).__name__}: {exc}" if named else type(exc).__name__
+            return None, Decision(
+                "deny", "gate_auto_decision_failed",
+                f"delegation-first gate: the routing decision for {repo} could not be "
+                f"created ({detail}); nothing is implemented until it can be", repos)
+        receipt = written(outcome, repo)
         if receipt is None:
-            return Decision(
-                "deny", "no_routing_receipt",
-                f"delegation-first gate: no routing receipt for {repo}. Register and claim "
-                f"the stage through agent-orchestration (stage_register, stage_claim), then "
-                f"call routing_decide with this repository; if the claim routes to the other "
-                f"provider, use execution_dispatch instead of editing here.", repos)
-        if receipt["valid_until"] <= now:
-            return Decision(
-                "deny", "routing_receipt_expired",
-                f"delegation-first gate: the routing receipt for {repo} (stage "
-                f"{receipt.get('item_id')}/{receipt.get('stage')}) expired. Renew the stage "
-                f"(stage_renew) and call routing_decide again.", repos, receipt)
-        if receipt["owner_route"] != client:
-            route = receipt["owner_route"]
-            call = "work_route_local" if route == "local" else "execution_dispatch"
-            automatic = ((" The routing decision was made automatically: "
-                          + str(receipt.get("code", "")) + ".")
-                         if receipt.get("automatic") else "")
-            return Decision(
-                "deny", "routed_elsewhere",
-                f"delegation-first gate: stage {receipt.get('item_id')}/{receipt.get('stage')} "
-                f"in {repo} is routed to {route}; this client does not implement it."
-                f"{automatic} Reason: {receipt.get('reason')}. Call {call} with "
-                f"item_id={receipt.get('item_id')!r}, stage={receipt.get('stage')!r}, "
-                f"owner_id={receipt.get('owner_id')!r}, "
-                f"stage_revision={receipt.get('stage_revision')} and your brief; the stage is "
-                f"already claimed, so no stage_register or stage_claim is needed.",
-                repos, receipt)
-        if capacity_db is not None:
-            stale = stage_binding(capacity_db, receipt, now)
-            if stale is not None:
+            # A decider that does not report what it wrote (only a test
+            # double does): resolve again, overtaken rules and all.
+            receipt, _ = effective(repo)
+        return receipt, None
+
+    def judge_held() -> Decision:
+        governing: dict[str, dict[str, Any]] = {}
+        for repo in repos:
+            try:
+                receipt, alongside = effective(repo)
+                if receipt is None and decide is not None:
+                    # No receipt yet: make the decision now rather than
+                    # refusing and asking the agent to make it. This is the
+                    # automatic part.
+                    receipt, failure = decide_now(repo, alongside)
+                    if failure is not None:
+                        return failure
+            except (OSError, ValueError) as exc:
+                return Decision("deny", "gate_state_unavailable",
+                                f"delegation-first gate: routing state could not be read "
+                                f"({type(exc).__name__}); nothing is implemented until it can",
+                                repos)
+            if receipt is None:
                 return Decision(
-                    "deny", stale,
-                    f"delegation-first gate: the routing receipt for {repo} names stage "
-                    f"{receipt.get('item_id')}/{receipt.get('stage')}, but the stage router no longer "
-                    f"shows it owned by {receipt.get('owner_id')} on route {receipt.get('owner_route')} "
-                    f"({stale}). Claim or renew the stage, then call routing_decide again.", repos, receipt)
-        governing[repo] = receipt
-    receipt = governing[repos[0]]
-    return Decision("allow", "routing_receipt_valid",
-                    f"stage {receipt.get('item_id')}/{receipt.get('stage')} is owned by this route",
+                    "deny", "no_routing_receipt",
+                    f"delegation-first gate: no routing receipt for {repo}. Register and claim "
+                    f"the stage through agent-orchestration (stage_register, stage_claim), then "
+                    f"call routing_decide with this repository; if the claim routes to the other "
+                    f"provider, use execution_dispatch instead of editing here.", repos)
+            if receipt["valid_until"] <= now:
+                return Decision(
+                    "deny", "routing_receipt_expired",
+                    f"delegation-first gate: the routing receipt for {repo} (stage "
+                    f"{receipt.get('item_id')}/{receipt.get('stage')}) expired. Renew the stage "
+                    f"(stage_renew) and call routing_decide again.", repos, receipt)
+            if receipt["owner_route"] != client:
+                route = receipt["owner_route"]
+                call = "work_route_local" if route == "local" else "execution_dispatch"
+                automatic = ((" The routing decision was made automatically: "
+                              + str(receipt.get("code", "")) + ".")
+                             if receipt.get("automatic") else "")
+                return Decision(
+                    "deny", "routed_elsewhere",
+                    f"delegation-first gate: stage {receipt.get('item_id')}/{receipt.get('stage')} "
+                    f"in {repo} is routed to {route}; this client does not implement it."
+                    f"{automatic} Reason: {receipt.get('reason')}. Call {call} with "
+                    f"item_id={receipt.get('item_id')!r}, stage={receipt.get('stage')!r}, "
+                    f"owner_id={receipt.get('owner_id')!r}, "
+                    f"stage_revision={receipt.get('stage_revision')} and your brief; the stage is "
+                    f"already claimed, so no stage_register or stage_claim is needed.",
                     repos, receipt)
+            if capacity_db is not None:
+                stale = stage_binding(capacity_db, receipt, now)
+                if stale is not None:
+                    return Decision(
+                        "deny", stale,
+                        f"delegation-first gate: the routing receipt for {repo} names stage "
+                        f"{receipt.get('item_id')}/{receipt.get('stage')}, but the stage router no longer "
+                        f"shows it owned by {receipt.get('owner_id')} on route {receipt.get('owner_route')} "
+                        f"({stale}). Claim or renew the stage, then call routing_decide again.", repos, receipt)
+            governing[repo] = receipt
+        receipt = governing[repos[0]]
+        return Decision("allow", "routing_receipt_valid",
+                        f"stage {receipt.get('item_id')}/{receipt.get('stage')} is owned by this route",
+                        repos, receipt)
+
+    # The whole judgment runs holding every enclosing repository's decision
+    # lock, which every writer of a routing receipt also takes (the gate here,
+    # ``routing_decide`` in the MCP). So the receipts read, the decision made
+    # and the receipt taken up are one consistent state: nothing is written
+    # between a read and the decision that depends on it, and two enclosing
+    # repositories cannot be seen at two different instants. Patching the
+    # read-after-write orderings one at a time found the next one each time.
+    # Acquired in the sorted order of ``repos``, one global order, so two
+    # gates never wait on each other in a cycle; ``routing_decide`` holds a
+    # single lock and cannot close one either.
+    try:
+        with contextlib.ExitStack() as held:
+            # One budget for all of them, so nested repositories cannot stack
+            # a full wait each against the hook's own timeout.
+            deadline = time.monotonic() + DECISION_LOCK_TIMEOUT_SECONDS
+            for repo in repos:
+                held.enter_context(decision_lock(state_root, repo,
+                                                 timeout=deadline - time.monotonic()))
+            # After the wait, not before: a decision another process made
+            # meanwhile carries capacity observed after the old instant, and
+            # judged against that it read as overtaken and was made again.
+            now = float(clock())
+            return judge_held()
+    except OSError as exc:
+        # TimeoutError (a lock nobody released in time) is an OSError.
+        return Decision("deny", "gate_state_unavailable",
+                        f"delegation-first gate: routing state could not be locked "
+                        f"({type(exc).__name__}); nothing is implemented until it can", repos)
 
 
 def judge(client: str, tool_name: str, tool_input: Any, cwd: str, *,
