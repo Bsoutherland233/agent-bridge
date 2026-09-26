@@ -91,6 +91,14 @@ jobs:
       - name: Offline test suite
         run: python3 tests/test_suite.py
 
+      - name: Optional peer rounds and local Room (fake providers only)
+        run: |
+          python3 -m unittest discover -s tests -p "test_chat_*.py"
+          python3 -m unittest discover -s tests -p "test_peer_rounds.py"
+          python3 -m unittest discover -s tests -p "test_peer_http.py"
+          python3 -m unittest discover -s tests -p "test_peer_mcp.py"
+          python3 -m unittest discover -s tests -p "test_peer_hermes.py"
+
       - name: Portable onboarding and optional local worker
         run: |
           python3 -m unittest discover -s tests -p "test_onboard.py"

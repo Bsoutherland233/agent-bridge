@@ -1,0 +1,112 @@
+"""Launch the local room; model calls remain gated by bridge evidence."""
+import argparse
+import copy
+import json
+import os
+from pathlib import Path
+import secrets
+import threading
+import urllib.request
+import webbrowser
+from .. import config, store as bridge_store
+from .storage import RoomStore
+from .dispatch import Dispatcher
+from .adapters import BridgeAdapter
+from .rounds import PeerRounds
+from .policy import RoomPolicy, room_config
+from .server import create_server
+from .windows_security import prepare_private_directory, verify_private_directory
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+def _local_opener():
+    # The room bearer token must never go through an environment proxy.
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
+def build_app(root: Path, allow_client: bool = False):
+    bridge_store.set_umask()
+    root = Path(root).resolve()
+    prepare_private_directory(root)
+    state = root / 'bridge'
+    prepare_private_directory(state)
+    candidate = root / 'broker.json'
+    if candidate.exists():
+        cfg = config.load(str(candidate))
+        if Path(cfg.state_root).resolve() != state:
+            raise ValueError('Room bridge state must stay inside its dedicated private directory')
+    else:
+        raw = copy.deepcopy(config.load().raw)
+        raw['state_root'] = str(state)
+        cfg = config.Config(raw, str(candidate))
+    policy = RoomPolicy(allow_client)
+    cfg = room_config(cfg, policy)
+    room_store = RoomStore(root / 'chat.sqlite', max_chars=min(12000, cfg.prompt_budget('start') - 2000))
+    if not room_store.rooms():
+        room_store.create_room('My agents')
+    room_store.recover_interrupted()
+    verify_private_directory(root)
+    adapters = {p: BridgeAdapter(cfg, p, root / 'canary-results.json') for p in ('claude', 'codex')}
+    dispatcher = Dispatcher(room_store, adapters)
+    token = secrets.token_urlsafe(32)
+    rounds = PeerRounds(room_store, adapters)
+    rounds_token = secrets.token_urlsafe(32)
+    server = create_server(room_store, dispatcher, token, policy=policy, rounds=rounds, rounds_token=rounds_token)
+    server.peer_rounds, server.rounds_token = rounds, rounds_token
+    return server, room_store, dispatcher, token
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Local internal agent room')
+    parser.add_argument('--open', action='store_true')
+    parser.add_argument('--state-dir', type=Path, default=Path.home() / '.agent-bridge' / 'chat')
+    args = parser.parse_args(argv)
+    root = args.state_dir.resolve()
+    prepare_private_directory(root)
+    runtime_path = root / 'runtime.json'
+    # A protected instance lock keeps a second launch from recovering live jobs.
+    try:
+        lock = bridge_store.file_lock(str(root / 'instance.lock'), timeout=0.2)
+        lock.__enter__()
+    except Exception:
+        try:
+            runtime = json.loads(runtime_path.read_text())
+            url = f"http://127.0.0.1:{int(runtime['port'])}"
+            request = urllib.request.Request(url + '/api/rooms', headers={'Authorization': 'Bearer ' + runtime['token']})
+            with _local_opener().open(request, timeout=3) as response:
+                if response.status != 200:
+                    raise ValueError('Existing room is not responding')
+            if args.open:
+                webbrowser.open(url + '/#token=' + runtime['token'])
+            return 0
+        except Exception:
+            raise SystemExit('Another room instance is starting or not responding. Retry shortly.')
+    server = dispatcher = None
+    try:
+        server, _, dispatcher, token = build_app(root)
+        bridge_store.atomic_write_json(str(runtime_path), {'port': server.server_port, 'token': token})
+        bridge_store.atomic_write_json(str(root / 'peer-runtime.json'), {'port': server.server_port, 'token': server.rounds_token})
+        thread = threading.Thread(target=dispatcher.loop, daemon=True)
+        thread.start()
+        threading.Thread(target=server.peer_rounds.loop, daemon=True).start()
+        if args.open:
+            webbrowser.open(f'http://127.0.0.1:{server.server_port}/#token={token}')
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if dispatcher:
+            dispatcher.closed.set()
+        if server:
+            server.peer_rounds.closed.set()
+            server.server_close()
+        runtime_path.unlink(missing_ok=True)
+        (root / 'peer-runtime.json').unlink(missing_ok=True)
+        lock.__exit__(None, None, None)
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
