@@ -1537,10 +1537,18 @@ def _judge_write(client: str, kind: str, paths: list[str], tool_input: Any, cwd:
                 receipt = written(outcome, repo)
                 if receipt is None:
                     # A decider that does not report what it wrote (only a
-                    # test double does): read back, as before this change.
-                    receipt = read_receipt(state_root, repo)
-                    if receipt is not None and is_another_clients_retain(receipt, client):
-                        receipt = read_receipt(state_root, repo, client)
+                    # test double does): resolve again, overtaken rules and all.
+                    receipt, _ = effective(repo)
+                else:
+                    # The decision just made governs unless the shared slot
+                    # now holds something that binds this client: a routed-away
+                    # or manual receipt, or one of its own, written by the
+                    # other client or process while this decision was in
+                    # flight. Only another client's retain yields to it.
+                    current = read_receipt(state_root, repo)
+                    if current is not None and current != receipt \
+                            and not is_another_clients_retain(current, client):
+                        receipt = current
             except (OSError, ValueError) as exc:
                 return Decision("deny", "gate_state_unavailable",
                                 f"delegation-first gate: routing state could not be read "

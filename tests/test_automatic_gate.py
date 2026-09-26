@@ -1875,6 +1875,39 @@ class ARetainIsNotAClaimOnTheRepository(AutoCase):
         decision = self.judge_in_process("codex", racing)
         self.assertEqual((decision.permission, decision.code), ("deny", "routed_elsewhere"))
 
+    def test_a_binding_shared_receipt_written_mid_decision_still_binds(self):
+        """The reverse interleaving (Codex's re-review): while codex's retain is
+        being decided beside claude's, a routed-away receipt naming claude
+        lands in the shared slot. It binds codex, so codex's fresh retain must
+        not win."""
+        self.arrange({})
+        self.hook("claude", self.repo)
+        codex_decide = gate.automatic_decider("codex", str(self.state), str(self.db))
+        shared_path = Path(gate.receipt_path(str(self.state), str(self.repo)))
+
+        def racing(repo, task_type, **kwargs):
+            outcome = codex_decide(repo, task_type, **kwargs)
+            self.assertTrue(outcome.receipt.get("retained_alongside"))
+            routed = json.loads(shared_path.read_text(encoding="utf-8"))
+            routed.update(decision="peer", code="routed_peer_implementation",
+                          owner_route="claude", caller="codex")
+            shared_path.write_text(json.dumps(routed), encoding="utf-8")   # the interleaved write
+            return outcome
+
+        decision = self.judge_in_process("codex", racing)
+        self.assertEqual((decision.permission, decision.code), ("deny", "routed_elsewhere"))
+
+    def test_a_decider_reporting_nothing_does_not_revive_an_overtaken_slot(self):
+        self.arrange({})
+        self.hook("claude", self.repo)
+        self.hook("codex", self.repo)
+        own = self.own_receipt("codex")
+        router = StageRouter(str(self.db))
+        router.complete(own["item_id"], own["stage"], owner_id=own["owner_id"],
+                        expected_revision=router.get(own["item_id"], own["stage"])["revision"])
+        decision = self.judge_in_process("codex", lambda repo, task_type, **kwargs: None)
+        self.assertEqual((decision.permission, decision.code), ("deny", "no_routing_receipt"))
+
     @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
                      "POSIX permission bits; root reads anything")
     def test_an_os_error_on_either_receipt_fails_closed(self):
