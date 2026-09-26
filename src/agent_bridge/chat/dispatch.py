@@ -90,5 +90,9 @@ class Dispatcher:
 
     def loop(self):
         while not self.closed.is_set():
-            if not self.run_once():
+            try:
+                if not self.run_once():
+                    self.closed.wait(0.3)
+            except Exception:
+                # A worker exception must not silently terminate the room service.
                 self.closed.wait(0.3)

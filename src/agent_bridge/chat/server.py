@@ -15,17 +15,30 @@ ASSETS.update({'/peer-rounds': ('peer-rounds.html', 'text/html'), '/peer-rounds.
 
 def create_server(store, dispatcher, token: str, port: int = 0, policy=None, rounds=None, rounds_token=None) -> ThreadingHTTPServer:
     policy = policy or RoomPolicy(False)
+    participant_ids = tuple(getattr(rounds, 'participants', None) or getattr(store, 'participants', PARTICIPANTS))
     cache, cache_lock = {}, threading.Lock()
+
+    def round_caller(authorization):
+        if not rounds_token:
+            return None
+        if isinstance(rounds_token, dict):
+            for caller, value in rounds_token.items():
+                if secrets.compare_digest(authorization, 'Bearer ' + value):
+                    return caller
+            return None
+        return '__legacy__' if secrets.compare_digest(authorization, 'Bearer ' + rounds_token) else None
 
     def participants():
         with cache_lock:
             if time.monotonic() - cache.get('at', -100) > 15:
                 cache['value'] = [{'id': p, **(dispatcher.adapters[p].status() if p in dispatcher.adapters else
-                                  {'state': 'unavailable', 'detail': 'Adapter not connected yet'})} for p in PARTICIPANTS]
+                                  {'state': 'unavailable', 'detail': 'Adapter not connected yet'})} for p in participant_ids]
                 cache['at'] = time.monotonic()
             return cache['value']
 
     class Handler(BaseHTTPRequestHandler):
+        timeout = 10
+
         def log_message(self, *args):
             pass
 
@@ -44,9 +57,11 @@ def create_server(store, dispatcher, token: str, port: int = 0, policy=None, rou
         def handle_request(self):
             expected = f'127.0.0.1:{self.server.server_port}'
             origin = 'http://' + expected
-            if self.headers.get('Host') != expected or self.headers.get('Origin', origin) != origin:
+            if self.headers.get('Host') != expected:
                 return self.send(403, {'error': 'Local origin required'})
             path = urlsplit(self.path).path
+            if path.startswith('/api/') and self.headers.get('Origin') != origin:
+                return self.send(403, {'error': 'Local origin required'})
             if self.command == 'GET' and path in ASSETS:
                 name, mime = ASSETS[path]
                 return self.send(200, (Path(__file__).parent / 'static' / name).read_bytes(), mime)
@@ -54,9 +69,12 @@ def create_server(store, dispatcher, token: str, port: int = 0, policy=None, rou
                 return self.send(404, {'error': 'Not found'})
             authorization = self.headers.get('Authorization', '')
             human = secrets.compare_digest(authorization, 'Bearer ' + token)
-            round_client = rounds_token is not None and secrets.compare_digest(authorization, 'Bearer ' + rounds_token)
+            matched_caller = round_caller(authorization)
+            round_client = matched_caller is not None
             if not human and not (round_client and path.startswith('/api/peer-rounds/')):
                 return self.send(403, {'error': 'Run start_chat.py --open to authenticate this window'})
+            if path.startswith('/api/peer-rounds/') and not round_client:
+                return self.send(403, {'error': 'Peer round client authentication required'})
             if self.command == 'POST' and self.headers.get('Origin') != origin:
                 return self.send(403, {'error': 'Local origin required'})
             try:
@@ -72,9 +90,11 @@ def create_server(store, dispatcher, token: str, port: int = 0, policy=None, rou
                         raise ValueError('JSON object required')
                 parts = path.strip('/').split('/')
                 if rounds is not None and parts[:2] == ['api', 'peer-rounds']:
-                    if len(parts) != 4 or parts[2] not in PARTICIPANTS:
+                    if len(parts) != 4 or parts[2] not in participant_ids:
                         return self.send(404, {'error': 'Not found'})
                     caller, action = parts[2:]
+                    if round_client and matched_caller != '__legacy__' and matched_caller != caller:
+                        return self.send(403, {'error': 'Caller token does not match this peer'})
                     if self.command == 'POST' and action == 'prepare':
                         result = rounds.prepare(caller, body)
                     elif self.command == 'GET' and action == 'status':
@@ -128,7 +148,7 @@ def create_server(store, dispatcher, token: str, port: int = 0, policy=None, rou
                                 rounds.stop_room(room)
                             result = dispatcher.stop(room)
                         elif parts[3] == 'reset':
-                            if body['target'] not in PARTICIPANTS:
+                            if body['target'] not in participant_ids:
                                 raise ValueError('Unknown target')
                             store.reset_session(room, body['target'])
                             result = {'ok': True}

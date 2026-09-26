@@ -11,7 +11,7 @@ from unittest.mock import patch
 class PeerHTTPTests(RoundTests):
     def setUp(self):
         super().setUp()
-        self.server = create_server(self.store, Dispatcher(self.store, self.adapters), 'human-token', rounds=self.rounds, rounds_token='client-token')
+        self.server = create_server(self.store, Dispatcher(self.store, self.adapters), 'human-token', rounds=self.rounds, rounds_token={'codex': 'client-token', 'claude': 'other-client-token'})
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(self.cleanup_server)
@@ -66,3 +66,14 @@ class PeerHTTPTests(RoundTests):
     def test_round_client_rejects_path_traversal_before_http(self):
         client = RoomClient('codex', self.store.path.parent)
         with self.assertRaises(ValueError): client.read({'round_id': '../peer-approvals'})
+
+    def test_round_token_is_bound_to_path_caller(self):
+        self.assertEqual(self.request('GET', '/api/peer-rounds/claude/status')[0], 403)
+
+    def test_api_requires_origin_header(self):
+        conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port)
+        conn.request('POST', '/api/peer-rounds/codex/prepare', json.dumps(self.args), {
+            'Authorization': 'Bearer client-token', 'Content-Type': 'application/json'})
+        response = conn.getresponse()
+        self.assertEqual(response.status, 403)
+        conn.close()

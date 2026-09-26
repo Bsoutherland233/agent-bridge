@@ -11,8 +11,11 @@ LABELS = ('public', 'synthetic', 'internal')
 
 
 class RoomStore:
-    def __init__(self, path: Path, max_chars: int = 12000):
+    def __init__(self, path: Path, max_chars: int = 12000, participants=None):
         self.path, self.max_chars = Path(path), max_chars
+        self.participants = tuple(participants or PARTICIPANTS)
+        if not self.participants or len(set(self.participants)) != len(self.participants):
+            raise ValueError('At least one distinct participant is required')
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.db() as db:
             if db.execute('PRAGMA user_version').fetchone()[0] not in (0, 1):
@@ -65,7 +68,7 @@ class RoomStore:
             raise ValueError(f'Message must contain 1–{self.max_chars} characters')
         if not isinstance(request_id, str) or not 1 <= len(request_id) <= 100:
             raise ValueError('Invalid request ID')
-        if not isinstance(recipients, list) or any(p not in PARTICIPANTS for p in recipients):
+        if not isinstance(recipients, list) or any(p not in self.participants for p in recipients):
             raise ValueError('Unknown recipient')
         if classification not in LABELS:
             raise ValueError('Unsupported classification; credentials and secrets are excluded')
@@ -178,11 +181,11 @@ class RoomStore:
         with self.db() as db:
             self._room(db, room_id)
             if lead is not None:
-                if lead not in PARTICIPANTS or not isinstance(participants, list) or any(p not in PARTICIPANTS for p in participants):
+                if lead not in self.participants or not isinstance(participants, list) or any(p not in self.participants for p in participants):
                     raise ValueError('Invalid room preferences')
                 db.execute('INSERT INTO room_preferences VALUES(?,?,?) ON CONFLICT(room) DO UPDATE SET lead=excluded.lead,participants=excluded.participants', (room_id, lead, json.dumps(sorted(set(participants)))))
             row = db.execute('SELECT * FROM room_preferences WHERE room=?', (room_id,)).fetchone()
-            return {'lead':row['lead'], 'participants':json.loads(row['participants'])} if row else {'lead':'codex','participants':list(PARTICIPANTS)}
+            return {'lead':row['lead'], 'participants':json.loads(row['participants'])} if row else {'lead':self.participants[0], 'participants':list(self.participants)}
     def rename_room(self, room_id, title):
         if not isinstance(title,str) or not title.strip() or len(title)>100:
             raise ValueError('Room title must contain 1-100 characters')

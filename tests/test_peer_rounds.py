@@ -62,6 +62,9 @@ class RoundTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 self.prepare(**changes)
         self.assertEqual(self.store.rooms(), [])
+        with self.store.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM peer_rounds').fetchone()[0], 0)
+        self.assertEqual([a.calls for a in self.adapters.values()], [[], []])
     def test_identity_and_idempotency(self):
         r = self.prepare()
         with self.assertRaises(ValueError): self.prepare(question='Changed')
@@ -110,6 +113,9 @@ class RoundTests(unittest.TestCase):
         with patch('agent_bridge.chat.rounds.time.time', return_value=1):
             r = self.prepare()
         self.assertEqual(self.rounds.read('codex', r['round_id'])['status'], 'expired')
+        self.assertEqual(self.rounds.read('codex', r['round_id'])['selection'], {})
+        with self.store.db() as db:
+            self.assertIsNone(db.execute('SELECT payload FROM peer_rounds WHERE id=?', (r['round_id'],)).fetchone()[0])
         self.assertFalse(self.rounds.run_once())
 
     def test_stop_prevents_later_peers_and_late_publication(self):

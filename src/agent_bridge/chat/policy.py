@@ -6,10 +6,20 @@ from .windows_security import verify_private_directory
 
 
 class RoomPolicy:
-    def __init__(self, allow_client: bool = False):
+    def __init__(self, cfg=None, allow_client: bool = False):
+        # Keep the old RoomPolicy(False) test/fixture shape while allowing the
+        # running room to enforce the bridge's per-peer classification policy.
+        if isinstance(cfg, bool) and allow_client is False:
+            allow_client, cfg = cfg, None
         if allow_client:
             raise ValueError('Client-derived material is not supported')
+        self.cfg = cfg
         self.allow_client = False
+
+    def _allowed(self, target: str) -> tuple[str, ...]:
+        if self.cfg is None:
+            return LABELS
+        return tuple(self.cfg.peer_allowed_classifications(target))
 
     def effective_classification(self, labels: list[str]) -> str:
         if any(label not in LABELS for label in labels):
@@ -17,9 +27,14 @@ class RoomPolicy:
         return next((label for label in ('internal', 'synthetic') if label in labels), 'public')
 
     def authorize(self, target: str, classification: str) -> None:
-        if target not in ('claude', 'codex'):
+        if self.cfg is not None:
+            try:
+                self.cfg.peer(target)
+            except (KeyError, ValueError):
+                raise ValueError('Unknown peer') from None
+        elif target not in ('claude', 'codex'):
             raise ValueError('Unknown peer')
-        if classification not in LABELS:
+        if classification not in LABELS or classification not in self._allowed(target):
             raise ValueError('Room policy refuses this classification')
 
 

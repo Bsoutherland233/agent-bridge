@@ -41,18 +41,19 @@ def build_app(root: Path, allow_client: bool = False):
         raw = copy.deepcopy(config.load().raw)
         raw['state_root'] = str(state)
         cfg = config.Config(raw, str(candidate))
-    policy = RoomPolicy(allow_client)
+    policy = RoomPolicy(cfg, allow_client)
     cfg = room_config(cfg, policy)
-    room_store = RoomStore(root / 'chat.sqlite', max_chars=min(12000, cfg.prompt_budget('start') - 2000))
+    participants = tuple(config.PEERS)
+    room_store = RoomStore(root / 'chat.sqlite', max_chars=min(12000, cfg.prompt_budget('start') - 2000), participants=participants)
     if not room_store.rooms():
         room_store.create_room('My agents')
     room_store.recover_interrupted()
     verify_private_directory(root)
-    adapters = {p: BridgeAdapter(cfg, p, root / 'canary-results.json') for p in ('claude', 'codex')}
+    adapters = {p: BridgeAdapter(cfg, p, root / 'canary-results.json') for p in participants}
     dispatcher = Dispatcher(room_store, adapters)
     token = secrets.token_urlsafe(32)
-    rounds = PeerRounds(room_store, adapters)
-    rounds_token = secrets.token_urlsafe(32)
+    rounds = PeerRounds(room_store, adapters, policy)
+    rounds_token = {caller: secrets.token_urlsafe(32) for caller in participants}
     server = create_server(room_store, dispatcher, token, policy=policy, rounds=rounds, rounds_token=rounds_token)
     server.peer_rounds, server.rounds_token = rounds, rounds_token
     return server, room_store, dispatcher, token
@@ -87,7 +88,7 @@ def main(argv=None):
     try:
         server, _, dispatcher, token = build_app(root)
         bridge_store.atomic_write_json(str(runtime_path), {'port': server.server_port, 'token': token})
-        bridge_store.atomic_write_json(str(root / 'peer-runtime.json'), {'port': server.server_port, 'token': server.rounds_token})
+        bridge_store.atomic_write_json(str(root / 'peer-runtime.json'), {'port': server.server_port, 'tokens': server.rounds_token, 'participants': list(server.peer_rounds.participants)})
         thread = threading.Thread(target=dispatcher.loop, daemon=True)
         thread.start()
         threading.Thread(target=server.peer_rounds.loop, daemon=True).start()
