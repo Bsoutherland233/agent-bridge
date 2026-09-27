@@ -14,10 +14,10 @@ class LaunchTests(StorageTests):
             self.addCleanup(app[0].server_close)
             private.assert_called_once()
 
-    def test_only_provider_neutral_adapters_are_registered(self):
+    def test_optional_providers_are_not_registered_by_default(self):
         app = build_app(Path(self.temp.name)/'configured')
         self.addCleanup(app[0].server_close)
-        self.assertEqual(set(app[2].adapters), {'claude', 'codex', 'grok'})
+        self.assertEqual(set(app[2].adapters), {'claude', 'codex'})
 
     def test_local_first_large_prompt_is_capped_before_provider_dispatch(self):
         app = build_app(Path(self.temp.name)/'local-first')
@@ -34,7 +34,12 @@ class LaunchTests(StorageTests):
         executable.write_bytes(b'fixture')
         app = build_app(Path(self.temp.name) / 'hermes-state', hermes_executable=executable)
         self.addCleanup(app[0].server_close)
-        self.assertEqual(set(app[2].adapters), {'claude', 'codex', 'hermes', 'grok'})
+        self.assertEqual(set(app[2].adapters), {'claude', 'codex', 'hermes'})
+
+    def test_explicit_grok_state_registers_optional_adapter(self):
+        app = build_app(Path(self.temp.name)/'grok-state', grok_state_dir=Path(self.temp.name)/'grok')
+        self.addCleanup(app[0].server_close)
+        self.assertEqual(set(app[2].adapters), {'claude', 'codex', 'grok'})
     def test_existing_instance_probe_disables_proxy_and_redirects(self):
         with patch('agent_bridge.chat.__main__.urllib.request.build_opener') as build:
             _local_opener()
