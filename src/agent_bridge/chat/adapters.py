@@ -29,11 +29,17 @@ class BridgeAdapter:
         if state['state'] != 'ready':
             raise ValueError(state['detail'])
 
+    def _check_local_first(self, prompt: str):
+        if self.cfg.local_first_enabled() and len(prompt.encode('utf-8')) >= self.cfg.local_first_min_bytes():
+            raise ValueError('Prompt is above the local_first limit; prepare a local digest before peer dispatch')
+
     def start(self, prompt: str, classification: str) -> dict:
+        self._check_local_first(prompt)
         self._admit()
         return broker.start(self.cfg, self.caller, {'prompt': prompt, 'source_classification': classification})
 
     def continue_(self, conversation_id: str, prompt: str, classification: str) -> dict:
+        self._check_local_first(prompt)
         self._admit()
         return broker.continue_(self.cfg, self.caller, {'conversation_id': conversation_id, 'prompt': prompt, 'source_classification': classification})
 

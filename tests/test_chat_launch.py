@@ -19,6 +19,15 @@ class LaunchTests(StorageTests):
         self.addCleanup(app[0].server_close)
         self.assertEqual(set(app[2].adapters), {'claude', 'codex'})
 
+    def test_local_first_large_prompt_is_capped_before_provider_dispatch(self):
+        app = build_app(Path(self.temp.name)/'local-first')
+        self.addCleanup(app[0].server_close)
+        adapter = app[2].adapters['claude']
+        adapter.cfg.raw['local_first'] = {'enabled': True, 'read_gate_min_bytes': 1}
+        with patch.object(adapter, 'status', return_value={'state': 'ready'}), patch('agent_bridge.chat.adapters.broker.start') as start:
+            with self.assertRaises(ValueError):
+                adapter.start('large enough', 'synthetic')
+        start.assert_not_called()
     def test_existing_instance_probe_disables_proxy_and_redirects(self):
         with patch('agent_bridge.chat.__main__.urllib.request.build_opener') as build:
             _local_opener()
