@@ -13,7 +13,8 @@ LABELS = ('public', 'synthetic', 'internal')
 class RoomStore:
     def __init__(self, path: Path, max_chars: int = 12000, participants=None):
         self.path, self.max_chars = Path(path), max_chars
-        self.participants = tuple(participants or PARTICIPANTS)
+        # Optional providers are added by the launcher only when explicitly enabled.
+        self.participants = tuple(participants or ('claude', 'codex'))
         if not self.participants or len(set(self.participants)) != len(self.participants):
             raise ValueError('At least one distinct participant is required')
         self.path.parent.mkdir(parents=True, exist_ok=True)
