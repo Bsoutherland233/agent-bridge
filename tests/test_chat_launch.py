@@ -40,6 +40,13 @@ class LaunchTests(StorageTests):
         app = build_app(Path(self.temp.name)/'grok-state', grok_state_dir=Path(self.temp.name)/'grok')
         self.addCleanup(app[0].server_close)
         self.assertEqual(set(app[2].adapters), {'claude', 'codex', 'grok'})
+
+    def test_grok_queue_cannot_be_inside_room_state(self):
+        root = Path(self.temp.name) / 'room'
+        with self.assertRaises(ValueError):
+            build_app(root, grok_state_dir=root / 'grok')
+        with self.assertRaises(ValueError):
+            build_app(root, grok_state_dir=root.parent)
     def test_existing_instance_probe_disables_proxy_and_redirects(self):
         with patch('agent_bridge.chat.__main__.urllib.request.build_opener') as build:
             _local_opener()

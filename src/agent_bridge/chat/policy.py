@@ -17,7 +17,7 @@ class RoomPolicy:
         self.allow_client = False
 
     def _allowed(self, target: str) -> tuple[str, ...]:
-        if self.cfg is None or target in ('hermes', 'grok'):
+        if self.cfg is None:
             return LABELS
         if target in ('hermes', 'grok'):
             return self.cfg.allowed_classifications

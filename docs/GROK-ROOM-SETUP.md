@@ -8,13 +8,14 @@ product/version and tool policy below.
 
 ## Exact execution boundary
 
-The host operator must approve each local-tool invocation. The only tools the
-Bot may use for this adapter are the two queue commands below, and the Bot's
-manifest must list exactly this allowlist:
+The host operator must approve each local-tool invocation. The repository
+cannot enforce what the Bot's local tool can access; the manifest is an
+operator declaration used to keep the queue opt-in and reviewable. The only
+commands this adapter documents are:
 
 ```text
-<python> <absolute-checkout>/grok_room.py next --wait <0..45>
-<python> <absolute-checkout>/grok_room.py reply <returned-job-id>
+<python> <absolute-checkout>/grok_room.py next --queue-dir <queue-dir> --wait <0..45>
+<python> <absolute-checkout>/grok_room.py reply --queue-dir <queue-dir> <returned-job-id> --file <queue-dir>\reply-<returned-job-id>.txt
 ```
 
 Before enabling the adapter, create `<state-dir>/bot-manifest.json` with the
@@ -26,13 +27,16 @@ actual values Scott approves:
   "version": "<exact Bot version>",
   "tools": ["grok_room.py next --wait", "grok_room.py reply <job-id>"],
   "allowlist": ["grok_room.py next --wait", "grok_room.py reply <job-id>"],
-  "approved_by": "Scott"
+  "approved_by": "pending"
 }
 ```
 
 The product/version and the tool list are factual inputs from the Bot owner;
 do not fill them with guesses. Until the manifest exists and matches the
-allowlist, Agent Room reports the Grok adapter as disconnected.
+declared command set, Agent Room reports the Grok adapter as disconnected.
+The queue directory must be a separate owner-only directory outside the Agent
+Room state directory. The repository does not inspect or control the Bot's
+other capabilities; the local operator approval is the execution boundary.
 
 The first command checks the private queue and claims one unexpired job. The
 second command reads one UTF-8 reply from standard input and completes that
@@ -69,11 +73,12 @@ availability. Pass the same private directory explicitly when it is not the
 default:
 
 ```text
-<python> <absolute-checkout>/grok_room.py next --state-dir <state-dir> --wait 45
-<python> <absolute-checkout>/grok_room.py reply --state-dir <state-dir> <job-id> --file <state-dir>\reply.txt
+<python> <absolute-checkout>/grok_room.py next --queue-dir <queue-dir> --wait 45
+<python> <absolute-checkout>/grok_room.py reply --queue-dir <queue-dir> <job-id> --file <queue-dir>\reply-<job-id>.txt
 ```
 
-The `--file` path must be directly inside the private state directory. Without
+The `--file` path must be the fixed `reply-<job-id>.txt` name directly inside
+the private queue directory. It is deleted after a successful reply. Without
 it, `reply` reads UTF-8 text from standard input.
 
 For a returned job, answer the selected question once and send the reply over

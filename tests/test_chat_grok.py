@@ -4,7 +4,7 @@ import json
 from unittest.mock import patch
 
 from test_chat_storage import StorageTests
-from agent_bridge.chat.grok import GrokAdapter, receive, respond
+from agent_bridge.chat.grok import GrokAdapter, receive, respond, job_path
 from agent_bridge.chat.policy import RoomPolicy
 
 
@@ -44,6 +44,7 @@ class GrokTests(StorageTests):
         respond(adapter.root, job['job_id'], 'Reply from existing Grok Bot')
         self.assertEqual(adapter.poll(job['job_id'])['status'], 'complete')
         self.assertEqual(adapter.read(job['job_id'])['peer_response'], 'Reply from existing Grok Bot')
+        self.assertFalse(job_path(adapter.root, job['job_id']).exists())
         with self.assertRaises(ValueError):
             respond(adapter.root, job['job_id'], 'duplicate')
 
@@ -86,3 +87,28 @@ class GrokTests(StorageTests):
         adapter = self.adapter('malformed')
         self.assertTrue((root / 'quarantine').is_dir())
         self.assertIsNone(receive(adapter.root, wait=0))
+
+    def test_mismatched_filename_and_invalid_expiry_are_quarantined(self):
+        adapter = self.adapter('invalid-records')
+        wrong_name = adapter.root / (str(__import__('uuid').uuid4()) + '.json')
+        wrong_name.write_text(json.dumps({'job_id': str(__import__('uuid').uuid4()), 'status': 'queued', 'expires': 1}), encoding='utf-8')
+        bad_expiry = adapter.root / (str(__import__('uuid').uuid4()) + '.json')
+        bad_expiry.write_text(json.dumps({'job_id': bad_expiry.stem, 'status': 'queued', 'expires': True}), encoding='utf-8')
+        self.assertIsNone(receive(adapter.root, wait=0))
+        quarantined = list((adapter.root / 'quarantine').glob('*.invalid'))
+        self.assertEqual(len(quarantined), 2)
+
+    def test_manifest_is_required_and_operator_declared(self):
+        root = Path(self.temp.name) / 'manifest'
+        adapter = GrokAdapter(root, RoomPolicy(False))
+        receive(root, wait=0)
+        self.assertNotEqual(adapter.status()['state'], 'ready')
+        manifest = {
+            'product': 'Grok Bot', 'version': 'fixture',
+            'tools': ['grok_room.py next --wait', 'grok_room.py reply <job-id>'],
+            'allowlist': ['grok_room.py next --wait', 'grok_room.py reply <job-id>'],
+            'approved_by': 'Scott',
+        }
+        (root / 'bot-manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+        self.assertEqual(adapter.status()['state'], 'ready')
+        self.assertIn('operator-declared', adapter.status()['detail'])

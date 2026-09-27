@@ -56,7 +56,10 @@ def build_app(root: Path, allow_client: bool = False, hermes_executable: Path | 
         if adapters['hermes'].status().get('state') == 'ready':
             participants.append('hermes')
     if grok_state_dir is not None:
-        adapters['grok'] = GrokAdapter(Path(grok_state_dir).resolve(), policy)
+        grok_root = Path(grok_state_dir).resolve()
+        if grok_root == root or grok_root in root.parents or root in grok_root.parents:
+            raise ValueError('Grok queue directory must be separate from the room state directory')
+        adapters['grok'] = GrokAdapter(grok_root, policy)
         if adapters['grok'].status().get('state') == 'ready':
             participants.append('grok')
     elif 'grok' in adapters:
