@@ -17,8 +17,10 @@ class RoomPolicy:
         self.allow_client = False
 
     def _allowed(self, target: str) -> tuple[str, ...]:
-        if self.cfg is None or target == 'hermes':
+        if self.cfg is None:
             return LABELS
+        if target == 'hermes':
+            return self.cfg.allowed_classifications
         return tuple(self.cfg.peer_allowed_classifications(target))
 
     def effective_classification(self, labels: list[str]) -> str:

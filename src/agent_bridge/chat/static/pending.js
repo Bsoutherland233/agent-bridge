@@ -25,7 +25,10 @@ class PendingSubmission {
 function conversationRecipients(text, mode, lead, selected, statuses) {
   if(mode==='note') return [];
   const mentions=addressedRecipients(text, [], statuses);
-  const recipients=mode==='discuss' ? [...new Set([...selected, lead, ...mentions])].sort() : (mentions.length ? mentions : [lead]);
+  const ready = new Set(statuses.filter(p => p.state === 'ready').map(p => p.id));
+  if (!ready.has(lead)) throw new Error(lead+' is not connected. Choose another agent or reconnect it.');
+  let recipients=mode==='discuss' ? [...new Set([...selected, lead, ...mentions])].sort() : (mentions.length ? mentions : [lead]);
+  if (mode === 'discuss') recipients = recipients.filter(id => id === lead || ready.has(id));
   for(const id of recipients) if(!statuses.some(p=>p.id===id && p.state==='ready')) throw new Error(id+' is not connected. Choose another agent or reconnect it.');
   if(mode==='discuss' && recipients.length<2) throw new Error('Choose at least two agents for a discussion.');
   return recipients;

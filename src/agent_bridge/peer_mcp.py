@@ -16,6 +16,20 @@ from .chat.windows_security import verify_private_directory
 class RoomClient:
     def __init__(self, caller, root):
         self.caller, self.root = caller, Path(root)
+        self.participants = tuple(PARTICIPANTS)
+
+    def registered_participants(self):
+        """Read the launcher's registered participant list when available."""
+        try:
+            verify_private_directory(self.root)
+            runtime = json.loads((self.root / 'peer-runtime.json').read_text(encoding='utf-8'))
+            values = runtime.get('participants')
+            if (isinstance(values, list) and values and all(isinstance(p, str) for p in values)
+                    and len(set(values)) == len(values)):
+                self.participants = tuple(values)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        return self.participants
 
     def _request(self, action, body=None):
         verify_private_directory(self.root)
@@ -55,9 +69,11 @@ def schema(properties, required):
 
 class PeerServer(Server):
     def __init__(self, caller, client):
-        if caller not in PARTICIPANTS: raise ValueError('Unknown caller')
+        registered = client.registered_participants() if hasattr(client, 'registered_participants') else getattr(client, 'participants', PARTICIPANTS)
+        if caller not in registered: raise ValueError('Unknown caller')
         self.caller, self.client = caller, client
-        peer_ids = tuple(getattr(client, 'participants', PARTICIPANTS))
+        peer_ids = tuple(registered)
+        self.participants = peer_ids
         others = [p for p in peer_ids if p != caller]
         self.tools = {
             'peers_prepare': {
@@ -108,7 +124,7 @@ def main(argv=None):
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser(description='Explicit peer rounds: MCP or local command client')
-    parser.add_argument('--caller', choices=PARTICIPANTS, required=True)
+    parser.add_argument('--caller', required=True)
     parser.add_argument('--state-dir', type=Path, default=Path.home()/'.agent-bridge'/'chat')
     parser.add_argument('action', nargs='?', choices=['mcp', 'prepare', 'read', 'status'], default='mcp')
     parser.add_argument('--round-id')

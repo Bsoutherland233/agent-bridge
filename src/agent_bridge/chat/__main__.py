@@ -44,11 +44,7 @@ def build_app(root: Path, allow_client: bool = False, hermes_executable: Path | 
         cfg = config.Config(raw, str(candidate))
     policy = RoomPolicy(cfg, allow_client)
     cfg = room_config(cfg, policy)
-    participants = tuple(config.PEERS)
-    room_store = RoomStore(root / 'chat.sqlite', max_chars=min(12000, cfg.prompt_budget('start') - 2000), participants=participants)
-    if not room_store.rooms():
-        room_store.create_room('My agents')
-    room_store.recover_interrupted()
+    participants = list(config.PEERS)
     verify_private_directory(root)
     adapters = {p: BridgeAdapter(cfg, p, root / 'canary-results.json') for p in participants}
     if hermes_executable is not None:
@@ -56,12 +52,17 @@ def build_app(root: Path, allow_client: bool = False, hermes_executable: Path | 
         if not hermes_executable.is_file():
             raise ValueError('Hermes executable must be a file')
         adapters['hermes'] = HermesAdapter(hermes_executable, root / 'hermes', policy)
-        participants.append('hermes')
-        room_store.participants = tuple(participants)
+        if adapters['hermes'].status().get('state') == 'ready':
+            participants.append('hermes')
+    room_store = RoomStore(root / 'chat.sqlite', max_chars=min(12000, cfg.prompt_budget('start') - 2000), participants=tuple(participants))
+    if not room_store.rooms():
+        room_store.create_room('My agents')
+    room_store.recover_interrupted()
     dispatcher = Dispatcher(room_store, adapters)
     token = secrets.token_urlsafe(32)
-    rounds = PeerRounds(room_store, adapters, policy)
-    rounds_token = {caller: secrets.token_urlsafe(32) for caller in adapters}
+    round_adapters = {p: adapters[p] for p in participants}
+    rounds = PeerRounds(room_store, round_adapters, policy)
+    rounds_token = {caller: secrets.token_urlsafe(32) for caller in participants}
     server = create_server(room_store, dispatcher, token, policy=policy, rounds=rounds, rounds_token=rounds_token)
     server.peer_rounds, server.rounds_token = rounds, rounds_token
     return server, room_store, dispatcher, token

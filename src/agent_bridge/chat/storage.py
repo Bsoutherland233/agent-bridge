@@ -6,7 +6,7 @@ import sqlite3
 import time
 import uuid
 
-PARTICIPANTS = ('claude', 'codex', 'hermes')
+PARTICIPANTS = ('claude', 'codex')
 LABELS = ('public', 'synthetic', 'internal')
 
 

@@ -91,8 +91,6 @@ class HermesAdapter:
 
     @staticmethod
     def _terminate_process_group(process):
-        if process.poll() is not None:
-            return
         if os.name == 'nt':
             subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -110,16 +108,20 @@ class HermesAdapter:
             cwd=job, env=child_environment(), shell=False,
             creationflags=flags, start_new_session=(os.name != 'nt'))
         output, errors, overflow = bytearray(), bytearray(), []
+        overflow_event = threading.Event()
 
         def drain(stream, target, limit, label):
             while True:
                 chunk = stream.read(65536)
                 if not chunk:
                     return
-                if len(target) < limit:
-                    target.extend(chunk[:limit - len(target)])
-                if len(target) + len(chunk) > limit:
+                room = limit - len(target)
+                if len(chunk) > room:
+                    target.extend(chunk[:max(0, room)])
                     overflow.append(label)
+                    overflow_event.set()
+                    return
+                target.extend(chunk)
 
         readers = [threading.Thread(target=drain, args=(process.stdout, output, OUTPUT_LIMIT, 'stdout'), daemon=True),
                    threading.Thread(target=drain, args=(process.stderr, errors, ERROR_LIMIT, 'stderr'), daemon=True)]
@@ -128,16 +130,27 @@ class HermesAdapter:
         try:
             process.stdin.write(prompt.encode('utf-8'))
             process.stdin.close()
-            returncode = process.wait(timeout=120)
-        except subprocess.TimeoutExpired:
-            self._terminate_process_group(process)
-            process.wait(timeout=5)
-            raise ValueError('Hermes timed out; its provider call may still consume usage') from None
+            deadline = time.monotonic() + 120
+            while True:
+                if overflow_event.is_set():
+                    self._terminate_process_group(process)
+                    process.wait(timeout=5)
+                    raise ValueError('Hermes response exceeded the room output limit')
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._terminate_process_group(process)
+                    process.wait(timeout=5)
+                    raise ValueError('Hermes timed out; its provider call may still consume usage') from None
+                try:
+                    returncode = process.wait(timeout=min(0.2, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
         finally:
             for reader in readers:
                 reader.join(timeout=5)
-        if overflow:
             self._terminate_process_group(process)
+        if overflow:
             raise ValueError('Hermes response exceeded the room output limit')
         return output.decode('utf-8', errors='replace'), returncode
 

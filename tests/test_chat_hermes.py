@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import subprocess
 from pathlib import Path
@@ -23,14 +24,11 @@ class HermesTests(StorageTests):
         with self.assertRaises(ValueError):
             adapter.fingerprint()
 
-    def test_selected_context_needs_separate_verification_evidence(self):
+    def test_status_does_not_depend_on_stale_verification_record(self):
         adapter = HermesAdapter(Path(self.temp.name) / 'hermes', Path(self.temp.name) / 'evidence', RoomPolicy(False))
         evidence = {'fingerprint': 'fixture', 'profile': 'default', 'start_pass': True, 'resume_pass': True}
         (adapter.root / 'verification.json').write_text(json.dumps(evidence), encoding='utf-8')
         with patch.object(adapter, 'fingerprint', return_value='fixture'), patch('agent_bridge.chat.hermes.verify_private_directory'):
-            self.assertNotEqual(adapter.status()['state'], 'ready')
-            evidence['selected_pass'] = True
-            (adapter.root / 'verification.json').write_text(json.dumps(evidence), encoding='utf-8')
             self.assertEqual(adapter.status()['state'], 'ready')
 
     def test_only_terminal_success_with_session_is_accepted(self):
@@ -49,23 +47,47 @@ class HermesTests(StorageTests):
         executable.write_bytes(b'fake executable for offline test')
         adapter = HermesAdapter(executable, Path(self.temp.name) / 'hermes', RoomPolicy(False))
 
-        def run(argv, **kwargs):
+        class FakeProcess:
+            pid = 12345
+
+            def __init__(self, argv, **kwargs):
+                self.argv, self.kwargs = argv, kwargs
+                class InputBuffer(io.BytesIO):
+                    def close(self):
+                        pass
+                self.stdin = InputBuffer()
+                self.stdout = io.BytesIO((json.dumps({'type': 'result', 'exit_code': 0, 'text': 'Real parsed reply', 'session_id': 'session-123'}) + '\n').encode())
+                self.stderr = io.BytesIO()
+                self.returncode = 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        created = []
+
+        def popen(argv, **kwargs):
             self.assertEqual(argv[1:4], ['--profile', 'default', 'chat'])
             self.assertIn('--resume', argv)
             self.assertEqual(argv[argv.index('--resume') + 1], 'session-123')
             self.assertNotIn('--yolo', argv)
             self.assertEqual(argv[argv.index('--toolsets') + 1], 'clarify')
-            self.assertEqual(kwargs['input'], 'Shared room message')
+            self.assertIs(kwargs['stdin'], subprocess.PIPE)
             self.assertEqual(kwargs['env'], {'PATH': 'fixture'})
-            kwargs['stdout'].write(json.dumps({'type': 'result', 'exit_code': 0, 'text': 'Real parsed reply', 'session_id': 'session-123'}))
-            return subprocess.CompletedProcess(argv, 0)
+            process = FakeProcess(argv, **kwargs)
+            created.append(process)
+            return process
 
         with patch.dict(os.environ, {'PATH': 'fixture', 'FAKE_API_KEY': 'secret'}, clear=True), \
                 patch.object(adapter, 'status', return_value={'state': 'ready'}), \
-                patch('agent_bridge.chat.hermes.subprocess.run', side_effect=run):
+                patch('agent_bridge.chat.hermes.subprocess.Popen', side_effect=popen), \
+                patch('agent_bridge.chat.hermes.subprocess.run'):
             result = adapter.continue_('session-123', 'Shared room message', 'synthetic')
         self.assertEqual(adapter.read(result['job_id'])['peer_response'], 'Real parsed reply')
         self.assertEqual(result['conversation_id'], 'session-123')
+        self.assertEqual(created[0].stdin.getvalue(), b'Shared room message')
 
     def test_missing_evidence_cannot_claim_ready(self):
         adapter = HermesAdapter(Path(self.temp.name) / 'absent.exe', Path(self.temp.name) / 'hermes', RoomPolicy(False))
