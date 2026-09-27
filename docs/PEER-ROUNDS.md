@@ -32,7 +32,7 @@ selected payload immediately while keeping the status and payload hash for
 review. Expired or rejected metadata is deleted after 30 days. Deleting a room
 also deletes its messages, jobs, sessions, requests, preferences, and peer
 round record. Completed replies remain in the room history until the room is
-deleted or the normal local retention process removes them.
+deleted; this feature does not run an automatic room-history cleanup job.
 
 The threat model covers accidental cross-room/history sharing, a peer treating
 another peer's reply as instructions, and a network client reaching the local
