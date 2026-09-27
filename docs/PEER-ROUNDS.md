@@ -23,7 +23,8 @@ Each room instance has one local SQLite file with two logical stores.
 idempotency records, and preferences; its `peer_rounds` table contains the
 selected payload, status, replies, room id, and a payload hash. `runtime.json` and
 `peer-runtime.json` contain short-lived loopback bearer credentials and the
-port; they are deleted when the launcher exits. The state directory is
+port; they are deleted on a normal launcher shutdown (a crash may leave stale
+runtime files for the next launch to reject or replace). The state directory is
 owner-only and must stay inside the dedicated room directory.
 
 Pending rounds expire after one hour. Expiry and explicit rejection clear the
