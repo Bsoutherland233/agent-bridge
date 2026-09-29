@@ -91,6 +91,8 @@ class HermesAdapter:
 
     @staticmethod
     def _terminate_process_group(process):
+        if process.poll() is not None:
+            return
         if os.name == 'nt':
             subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -149,7 +151,8 @@ class HermesAdapter:
         finally:
             for reader in readers:
                 reader.join(timeout=5)
-            self._terminate_process_group(process)
+            if process.poll() is None:
+                self._terminate_process_group(process)
         if overflow:
             raise ValueError('Hermes response exceeded the room output limit')
         return output.decode('utf-8', errors='replace'), returncode

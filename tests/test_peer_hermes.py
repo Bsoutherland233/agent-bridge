@@ -33,8 +33,9 @@ class SelectedHermesTests(RoundTests):
             self.assertTrue(kwargs['start_new_session'] or kwargs['creationflags'])
             return FakeProcess((json.dumps({'type': 'result', 'exit_code': 0, 'text': 'answer', 'session_id': 'fixture'}) + '\n').encode())
 
-        with patch.object(adapter, 'status', return_value={'state': 'ready'}), patch('agent_bridge.chat.hermes.subprocess.Popen', side_effect=fake_popen):
+        with patch.object(adapter, 'status', return_value={'state': 'ready'}), patch('agent_bridge.chat.hermes.subprocess.Popen', side_effect=fake_popen), patch.object(adapter, '_terminate_process_group') as terminate:
             result = adapter.start_selected('chosen context', 'synthetic')
+        terminate.assert_not_called()
         self.assertTrue(result['ok'])
         self.assertTrue((adapter.root / result['job_id'] / 'result.json').exists())
         self.assertEqual(adapter.read(result['job_id'])['peer_response'], 'answer')
