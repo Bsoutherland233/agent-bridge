@@ -22,9 +22,11 @@ PROTOCOL_VERSION = "2025-06-18"
 SERVER_VERSION = "0.2.0"
 MAX_FRAME_CHARS = 2 * 1024 * 1024
 INSTRUCTIONS = (
-    "Durable work orchestration and local mechanical non-client processing. "
-    "This is separate from peer consultation. Local drafts require review; "
-    "client-derived or confidential input and silent cloud fallback are refused."
+    "Durable work orchestration and local mechanical processing. This is separate "
+    "from peer consultation. Route mechanical work, client-derived included, through "
+    "work_checkpoint and work_route_local with its true classification; the on-device "
+    "lane accepts client_derived. Peer and execution routes refuse client-derived input. "
+    "Local drafts require review; silent cloud fallback is refused."
 )
 
 
