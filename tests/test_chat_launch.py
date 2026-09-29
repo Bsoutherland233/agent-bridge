@@ -46,7 +46,10 @@ class LaunchTests(StorageTests):
         restarted = build_app(root, allow_client=False)
         self.addCleanup(restarted[0].server_close)
         self.assertEqual(restarted[1].snapshot(room)['jobs'][0]['status'], 'failed')
-        self.assertEqual(restarted[1].path.parent, root)
+        # The runtime stores the canonical filesystem path. On macOS, a
+        # temporary directory can be spelled /var/... while resolve() returns
+        # /private/var/..., even though both names identify the same folder.
+        self.assertEqual(restarted[1].path.parent, root.resolve())
 
     def test_entrypoint_help_works_from_other_directory(self):
         script = Path(__file__).resolve().parents[1] / 'start_chat.py'
