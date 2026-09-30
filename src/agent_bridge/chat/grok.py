@@ -83,6 +83,7 @@ class GrokAdapter:
 
     def __init__(self, root: Path, policy):
         self.root, self.policy = root, policy
+        store.set_umask()
         prepare_private_directory(root)
         _cleanup(root)
         with store.file_lock(str(root / 'queue.lock')):
@@ -162,6 +163,7 @@ class GrokAdapter:
 
 
 def receive(root: Path, wait: int = 45):
+    store.set_umask()
     prepare_private_directory(root)
     _cleanup(root)
     deadline = time.monotonic() + max(0, min(wait, 45))

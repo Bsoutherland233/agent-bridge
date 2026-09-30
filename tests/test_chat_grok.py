@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 import json
+import unittest
 from unittest.mock import patch
 
 from test_chat_storage import StorageTests
@@ -18,6 +19,18 @@ class GrokTests(StorageTests):
             'allowlist': ['grok_room.py next --wait', 'grok_room.py reply <job-id>'],
             'approved_by': 'Scott'}), encoding='utf-8')
         return adapter
+
+    @unittest.skipIf(os.name == 'nt', 'Windows queue privacy is verified by ACL tests')
+    def test_adapter_sets_private_umask_before_operator_writes_manifest(self):
+        previous_umask = os.umask(0o022)
+        try:
+            root = Path(self.temp.name) / 'private-manifest'
+            GrokAdapter(root, RoomPolicy(False))
+            manifest = root / 'bot-manifest.json'
+            manifest.write_text('{}', encoding='utf-8')
+            self.assertEqual(manifest.stat().st_mode & 0o077, 0)
+        finally:
+            os.umask(previous_umask)
 
     def test_restart_cancels_unpulled_request(self):
         adapter = self.adapter()
