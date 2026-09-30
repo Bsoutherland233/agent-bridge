@@ -1,7 +1,7 @@
 """Bounded Claude subscription implementation lane."""
 from __future__ import annotations
 
-import argparse, hashlib, json, os, platform, shutil, stat, subprocess, sys, tempfile, time, uuid
+import argparse, hashlib, json, os, platform, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 try:
     from .. import runner
@@ -509,6 +509,60 @@ def _sandbox_exec_confined(command:list[str],tree:Path,scratch:Path,env:dict[str
     result.duration_seconds=time.monotonic()-started
     return result
 
+def _generation_fence(tree:Path,tmp:Path,config_dir:Path|None,home:Path)->str:
+    """A macOS sandbox profile that lets Claude generation write only where it must.
+
+    Network and reads stay open: generation has to reach Anthropic and read
+    the worktree. Writes are limited to the worktree, a private temp directory,
+    the lane's own config store (and the CLI's lock beside it), the CLI's
+    version lock under ~/.local/state/claude, its socket directory, and the
+    login keychain the CLI's `security` child updates on a token refresh. The
+    list was measured, not guessed: one synthetic haiku run under a
+    report-every-write profile (2026-09-30) recorded exactly these targets.
+    The fence exists so that giving each job a private clone does not also
+    remove the only thing that would notice a job writing into the operator's
+    checkout: without it the Edit and Write tools can reach any path the
+    account can.
+    """
+    def literal(path:Path)->str:
+        text=str(path)
+        if '"' in text or "\\" in text or any(ord(c)<32 for c in text):
+            raise TaskError("a path in the generation fence has an unsupported character")
+        return text
+    allowed=[f'(subpath "{literal(p)}")' for p in dict.fromkeys((tree,tree.resolve(),tmp,tmp.resolve()))]
+    if config_dir is not None:
+        for p in dict.fromkeys((config_dir,config_dir.resolve())):
+            allowed.append(f'(subpath "{literal(p)}")')
+            allowed.append(f'(literal "{literal(p)}.lock")')
+    state=home/".local"/"state"/"claude"
+    allowed.append(f'(subpath "{literal(state)}")')
+    allowed.append('(subpath "/private/tmp/cc-socks")')
+    keychain=re.escape(literal(home/"Library"/"Keychains"/"login.keychain-db"))
+    allowed.append(f'(regex #"^{keychain}(\\.sb-[^/]+)?$")')
+    for device in ("/dev/null","/dev/tty","/dev/dtracehelper"):
+        allowed.append(f'(literal "{device}")')
+    return ("(version 1)\n(allow default)\n(deny file-write*)\n"
+            f"(allow file-write* {' '.join(allowed)})\n")
+
+def _fenced_generation(command:list[str],job:Path,gen:Path,config_dir:Path|None,env:dict[str,str],
+                       backend_name:str|None):
+    """``command`` and ``env`` for generation, write-fenced where the host can.
+
+    Keyed on the confinement backend this run already selected, never on the
+    platform's name. Only sandbox-exec can fence writes while leaving the
+    network open today; the Linux backend's namespace also removes the
+    network, which generation needs. Elsewhere the command runs unfenced and
+    the receipt says so (``generation_write_fence``), so nothing downstream
+    can mistake an unfenced run for a fenced one."""
+    if backend_name!=hostenv.MACOS_SANDBOX_EXEC:
+        return command,env,None
+    tmp=job/"generation-tmp"; tmp.mkdir(mode=0o700)
+    profile=job/"generation.sb"
+    profile.write_text(_generation_fence(gen,tmp,config_dir,Path(env.get("HOME") or Path.home())))
+    os.chmod(profile,0o600)
+    return ([hostenv.SANDBOX_EXEC,"-f",str(profile),*command],
+            {**env,"TMPDIR":str(tmp)},hostenv.MACOS_SANDBOX_EXEC)
+
 def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config_dir:Path|None=None,
              classification:str,model:str,effort:str,
              verify_argv:list[list[str]],base:str="HEAD",timeout:int=900,verify_timeout:int=300):
@@ -554,7 +608,9 @@ def run_task(*,brief:Path,repo:Path,task_root:Path,claude_bin:Path,claude_config
     try:
         receipt["auth"]=_auth(claude_bin,env)
         _git(repo,"worktree","add","--detach",str(gen),base_sha,timeout=120,env=env); marker=(gen/".git").read_bytes()
-        r=_run(_command(claude_bin,model,effort),cwd=gen,env=env,timeout=timeout,input_bytes=("TASK BRIEF\n\n"+brief_text).encode())
+        gen_command,gen_env,fence=_fenced_generation(_command(claude_bin,model,effort),job,gen,claude_config_dir,env,backend.name)
+        receipt["generation_write_fence"]=fence
+        r=_run(gen_command,cwd=gen,env=gen_env,timeout=timeout,input_bytes=("TASK BRIEF\n\n"+brief_text).encode())
         for n,data in (("claude.stdout",r.stdout),("claude.stderr",r.stderr)):
             (job/n).write_bytes(data); os.chmod(job/n,0o600)
             receipt[n.replace(".","_")+"_sha256"]=hashlib.sha256(data).hexdigest()
