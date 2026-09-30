@@ -116,6 +116,15 @@ class SubprocessHarnessExecutor:
             raise ExecutionAdmissionError("claude_config_dir_unavailable")
         if os.name != "posix":
             raise ExecutionAdmissionError("execution_worker_platform_unsupported")
+        # Before any provider run. The verify step runs with this worker's
+        # PATH; a command that cannot start here would otherwise fail only
+        # after the whole generation, minutes later (live jobs 9e66f13c,
+        # 2039124c, c0849b26, beffeccc, 7dcda0b7).
+        try:
+            verify_policy.check_runnable(request["verify_argv"],
+                                         os.environ.get("PATH", "/usr/bin:/bin"))
+        except verify_policy.VerifyPolicyError as exc:
+            raise ExecutionAdmissionError(f"verify_not_runnable: {exc}") from None
         # Imported only at execution time so the queue/status MCP remains
         # importable on Windows, where the persistent worker is not supported.
         import pwd
