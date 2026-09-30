@@ -361,6 +361,17 @@ class ClaudeTaskTests(unittest.TestCase):
     def test_detects_source_checkout_mutation(self):
         requires_confinement(self)
         self.fake.write_text("#!/bin/sh\ncase \"$*\" in *\"--version\"*) echo fake; exit;; *\"auth status\"*) printf '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"subscriptionType\":\"team\"}\\n'; exit;; esac\nprintf 'corrupt\\n' > " + str(self.repo / "value.txt") + "\nprintf 'after\\n' > value.txt\nprintf '{\"result\":\"done\",\"is_error\":false}\\n'\n")
+        if hostenv.confinement("synthetic").name == hostenv.MACOS_SANDBOX_EXEC:
+            # Where the write fence applies, the write into the source checkout
+            # never happens, so there is nothing for the integrity check to see.
+            result = run_task(brief=self.brief, repo=self.repo, task_root=self.root / "tasks-fenced",
+                              claude_bin=self.fake, claude_config_dir=self.store,
+                              classification="synthetic", model="fake", effort="low",
+                              verify_argv=[["git", "diff", "--check"]])
+            self.assertEqual((self.repo / "value.txt").read_text(), "before\n")
+            receipt = json.loads((Path(result["job_dir"]) / "receipt.json").read_text())
+            self.assertEqual(receipt["generation_write_fence"], hostenv.MACOS_SANDBOX_EXEC)
+            return
         with self.assertRaises(TaskError):
             run_task(brief=self.brief, repo=self.repo, task_root=self.root / "tasks",
                      claude_bin=self.fake, claude_config_dir=self.store,
@@ -804,3 +815,90 @@ class ClaudeTaskErrorDetailTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GenerationFenceTests(unittest.TestCase):
+    """The write fence around Claude generation (macOS sandbox-exec)."""
+
+    def test_the_profile_denies_writes_and_names_only_the_measured_targets(self):
+        home = Path("/Users/example")
+        profile = claude_task._generation_fence(Path("/j/gen"), Path("/j/tmp"),
+                                                home / ".agent-bridge" / "claude-home", home)
+        self.assertIn("(deny file-write*)", profile)
+        self.assertNotIn("network", profile)       # generation must reach Anthropic
+        for target in ('(subpath "/j/gen")', '(subpath "/j/tmp")',
+                       '(subpath "/Users/example/.agent-bridge/claude-home")',
+                       '(literal "/Users/example/.agent-bridge/claude-home.lock")',
+                       '(subpath "/Users/example/.local/state/claude/locks")',
+                       '(subpath "/private/tmp/cc-socks")'):
+            self.assertIn(target, profile)
+        self.assertIn("login\\.keychain", profile)
+        self.assertIn('(process-path "/usr/bin/security")', profile)
+        self.assertNotIn('(subpath "/Users/example/Library', profile)
+        self.assertNotIn('(subpath "/Users/example")', profile)
+
+    def test_a_path_that_would_break_the_profile_is_refused(self):
+        for bad in ('/j/ge"n', "/j/ge\\n", "/j/ge\nn"):
+            with self.subTest(path=bad):
+                with self.assertRaises(TaskError):
+                    claude_task._generation_fence(Path(bad), Path("/j/tmp"), None, Path("/Users/x"))
+
+    @unittest.skipUnless(os.path.isfile(hostenv.SANDBOX_EXEC), "the fence is sandbox-exec")
+    def test_the_fence_allows_the_worktree_and_blocks_everything_else(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            job, gen, outside = root / "job", root / "gen", root / "outside"
+            for d in (job, gen, outside):
+                d.mkdir()
+            command, env, fence = claude_task._fenced_generation(
+                ["/usr/bin/touch"], job, gen, None, {"HOME": str(root), "PATH": "/usr/bin:/bin"},
+                hostenv.MACOS_SANDBOX_EXEC)
+            self.assertEqual(fence, hostenv.MACOS_SANDBOX_EXEC)
+            self.assertEqual(env["TMPDIR"], str(job / "generation-tmp"))
+            inside = subprocess.run([*command, str(gen / "ok")], env=env, capture_output=True)
+            blocked = subprocess.run([*command, str(outside / "no")], env=env, capture_output=True)
+            self.assertEqual(inside.returncode, 0, inside.stderr)
+            self.assertTrue((gen / "ok").exists())
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertFalse((outside / "no").exists())
+
+    @unittest.skipUnless(os.path.isfile(hostenv.SANDBOX_EXEC), "the fence is sandbox-exec")
+    def test_symlinks_are_judged_by_target_and_hard_links_are_refused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            job, gen, outside = root / "job", root / "gen", root / "outside"
+            for d in (job, gen, outside):
+                d.mkdir()
+            target = outside / "target"
+            target.write_text("orig")
+            (gen / "sym").symlink_to(target)
+            command, env, _ = claude_task._fenced_generation(
+                ["/bin/sh", "-c", f"echo x > {gen / 'sym'}"], job, gen, None,
+                {"HOME": str(root), "PATH": "/usr/bin:/bin"}, hostenv.MACOS_SANDBOX_EXEC)
+            subprocess.run(command, env=env, capture_output=True)
+            self.assertEqual(target.read_text(), "orig")
+            os.link(target, gen / "hard")
+            with self.assertRaisesRegex(TaskError, "hard-linked"):
+                claude_task._fenced_generation(["x"], root / "job2", gen, None,
+                                               {"HOME": str(root)}, hostenv.MACOS_SANDBOX_EXEC)
+
+    @unittest.skipUnless(os.path.isfile(hostenv.SANDBOX_EXEC), "the fence is sandbox-exec")
+    def test_only_the_security_program_may_write_the_keychain_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            keychains = root / "Library" / "Keychains"
+            keychains.mkdir(parents=True)
+            job, gen = root / "job", root / "gen"
+            job.mkdir(); gen.mkdir()
+            command, env, _ = claude_task._fenced_generation(
+                ["/usr/bin/touch", str(keychains / "login.keychain-db")], job, gen, None,
+                {"HOME": str(root), "PATH": "/usr/bin:/bin"}, hostenv.MACOS_SANDBOX_EXEC)
+            result = subprocess.run(command, env=env, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((keychains / "login.keychain-db").exists())
+
+    def test_a_backend_that_cannot_fence_writes_says_so(self):
+        command, env, fence = claude_task._fenced_generation(
+            ["x"], Path("/j"), Path("/g"), None, {}, hostenv.LINUX_USERNS)
+        self.assertIsNone(fence)
+        self.assertEqual(command, ["x"])
