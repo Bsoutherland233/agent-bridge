@@ -103,7 +103,7 @@ def check_runnable(commands: list[list[str]], path: str, *,
         resolved = which(program, path=path)
         if not resolved:
             raise VerifyPolicyError(MESSAGE_NOT_ON_PATH.format(program))
-        if program in PYTHON_PROGRAMS and command[2] == "pytest":
+        if program in PYTHON_PROGRAMS and command[1:3] == ["-m", "pytest"]:
             code = ("import importlib.util, sys; "
                     f"sys.exit(0 if importlib.util.find_spec('pytest') else {_PROBE_UNAVAILABLE})")
             with tempfile.TemporaryDirectory(prefix="verify-probe-") as home:
