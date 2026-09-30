@@ -60,7 +60,9 @@ def create_server(store, dispatcher, token: str, port: int = 0, policy=None, rou
             if self.headers.get('Host') != expected:
                 return self.send(403, {'error': 'Local origin required'})
             path = urlsplit(self.path).path
-            if path.startswith('/api/') and self.headers.get('Origin') != origin:
+            # Browser same-origin GETs normally omit Origin.  A supplied
+            # foreign Origin is still refused, and POST below remains strict.
+            if path.startswith('/api/') and self.headers.get('Origin') not in (None, origin):
                 return self.send(403, {'error': 'Local origin required'})
             if self.command == 'GET' and path in ASSETS:
                 name, mime = ASSETS[path]

@@ -83,7 +83,13 @@ class RoundTests(unittest.TestCase):
         self.rounds.approve(r['round_id'])
         restarted = PeerRounds(self.store, self.adapters)
         self.assertFalse(restarted.run_once())
-        self.assertEqual(restarted.read('codex', r['round_id'])['status'], 'interrupted')
+        result = restarted.read('codex', r['round_id'])
+        self.assertEqual(result['status'], 'interrupted')
+        self.assertEqual(result['selection'], {})
+        with self.store.db() as db:
+            row = db.execute('SELECT payload, terminal_at FROM peer_rounds WHERE id=?', (r['round_id'],)).fetchone()
+        self.assertIsNone(row['payload'])
+        self.assertIsNotNone(row['terminal_at'])
     def test_room_history_is_never_selected_implicitly(self):
         room = self.store.create_room('Existing')['id']
         self.store.submit(room, 'old', 'private old history', [], 'internal')
@@ -107,6 +113,9 @@ class RoundTests(unittest.TestCase):
         self.assertEqual(len(self.rounds.pending()), 1)
         self.assertEqual(latest['status'], 'pending')
         self.rounds.approve(latest['round_id'], reject=True)
+        self.assertEqual(self.rounds.read('codex', latest['round_id'])['selection'], {})
+        with self.store.db() as db:
+            self.assertIsNone(db.execute('SELECT payload FROM peer_rounds WHERE id=?', (latest['round_id'],)).fetchone()[0])
         self.assertFalse(self.rounds.run_once())
 
     def test_read_reports_expired_draft_without_opening_review_page(self):

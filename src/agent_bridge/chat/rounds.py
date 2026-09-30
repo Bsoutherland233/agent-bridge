@@ -31,8 +31,11 @@ class PeerRounds:
                 db.execute('ALTER TABLE peer_rounds ADD COLUMN payload_hash TEXT')
             if 'terminal_at' not in columns:
                 db.execute('ALTER TABLE peer_rounds ADD COLUMN terminal_at REAL')
-            # Never resume provider work after a service restart.
-            db.execute("UPDATE peer_rounds SET status='interrupted' WHERE status IN ('approved','running')")
+            # Never resume provider work after a service restart, and do not
+            # retain the selected question/context for an abandoned round.
+            now = time.time()
+            db.execute("UPDATE peer_rounds SET status='interrupted', payload=NULL, terminal_at=? WHERE status IN ('approved','running')", (now,))
+            self._expire(db)
 
     def prepare(self, caller, args):
         required = {'request_id', 'targets', 'question', 'source_classification'}
@@ -101,11 +104,11 @@ class PeerRounds:
     def _expire(self, db):
         now = time.time()
         db.execute("UPDATE peer_rounds SET status='expired', payload=NULL, terminal_at=? WHERE status='pending' AND created<?", (now, now-EXPIRE_SECONDS))
-        db.execute("DELETE FROM peer_rounds WHERE status IN ('expired','rejected') AND terminal_at IS NOT NULL AND terminal_at<?", (now-TERMINAL_RETENTION_SECONDS,))
+        db.execute("DELETE FROM peer_rounds WHERE status IN ('expired','rejected','interrupted','cancelled','completed') AND terminal_at IS NOT NULL AND terminal_at<?", (now-TERMINAL_RETENTION_SECONDS,))
 
     def stop_room(self, room):
         with self.store.db() as db:
-            return db.execute("UPDATE peer_rounds SET status='cancelled' WHERE room=? AND status='running'", (room,)).rowcount
+            return db.execute("UPDATE peer_rounds SET status='cancelled', payload=NULL, terminal_at=? WHERE room=? AND status='running'", (time.time(), room)).rowcount
 
     def delete_room(self, room):
         with self.store.db() as db:
@@ -155,7 +158,7 @@ class PeerRounds:
                     db.execute('INSERT INTO messages(room,author,text,classification,created) VALUES(?,?,?,?,?)',
                                (room, target, reply.get('text', reply.get('error', 'No reply')), data['source_classification'], time.time()))
         with self.store.db() as db:
-            db.execute("UPDATE peer_rounds SET status='completed' WHERE id=? AND status='running'", (row['id'],))
+            db.execute("UPDATE peer_rounds SET status='completed', payload=NULL, terminal_at=? WHERE id=? AND status='running'", (time.time(), row['id']))
         return True
 
     def _consult(self, target, prompt, classification, active):

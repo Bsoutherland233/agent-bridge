@@ -34,6 +34,13 @@ class HTTPTests(StorageTests):
         for headers in [{'Authorization': ''}, {'Origin': 'https://evil.example'}, {'Host': 'evil.example'}]:
             self.assertEqual(self.request('GET', '/api/rooms', headers=headers)[0], 403)
 
+    def test_human_get_without_origin_is_allowed(self):
+        conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port)
+        conn.request('GET', '/api/rooms', headers={'Authorization': 'Bearer test-token'})
+        response = conn.getresponse()
+        self.assertEqual(response.status, 200)
+        conn.close()
+
     def test_note_roundtrip_and_literal_content(self):
         body = {'request_id': 'x', 'text': '<script>alert(1)</script>', 'recipients': [], 'classification': 'public', 'mode': 'note'}
         self.assertEqual(self.request('POST', f'/api/rooms/{self.room}/messages', body)[0], 200)
