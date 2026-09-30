@@ -16,7 +16,6 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from agent_bridge.execution import verify_policy
 from agent_bridge.execution.verify_policy import VerifyPolicyError, check_runnable
 from agent_bridge.orchestration.execution_queue import (
     ExecutionAdmissionError, Harnesses, SubprocessHarnessExecutor)
@@ -46,60 +45,37 @@ class CheckRunnableTests(unittest.TestCase):
                                             f"not on the worker's PATH: {command[0]}$"):
                     check_runnable([command], self.bin)
 
-    def test_an_interpreter_without_pytest_is_refused(self):
-        # Live jobs 9e66f13c, 2039124c: "No module named pytest".
-        _program(self.bin, "python3", exit_code=3)
-        with self.assertRaisesRegex(VerifyPolicyError,
-                                    "not importable by the worker's python3: pytest"):
-            check_runnable([["python3", "-m", "pytest", "-q"]], self.bin)
-
-    def test_a_probe_that_cannot_answer_is_a_refusal_not_a_pass(self):
-        _program(self.bin, "python3", exit_code=1)
-        with self.assertRaisesRegex(VerifyPolicyError, "could not check"):
-            check_runnable([["python3", "-m", "pytest"]], self.bin)
-        _program(self.bin, "python3", exit_code=0)
-        with self.assertRaisesRegex(VerifyPolicyError, "could not check"):
-            check_runnable([["python3", "-m", "pytest"]], self.bin, run=mock.Mock(
-                side_effect=subprocess.TimeoutExpired("python3", 30)))
-
     def test_runnable_commands_pass(self):
-        _program(self.bin, "python3", exit_code=0)
+        _program(self.bin, "python3")
         _program(self.bin, "pytest")
         check_runnable([["python3", "-m", "pytest", "-q"], ["pytest"],
                         ["python3", "-m", "unittest", "discover"], ["git", "status"]],
                        self.bin)
 
-    def test_unittest_and_git_are_not_probed(self):
+    def test_git_is_not_looked_up(self):
+        check_runnable([["git", "diff"]], self.bin)
+
+    def test_nothing_is_executed(self):
         _program(self.bin, "python3", exit_code=3)
-        run = mock.Mock()
-        check_runnable([["python3", "-m", "unittest"], ["git", "diff"]], self.bin, run=run)
+        with mock.patch.object(subprocess, "run") as run, \
+                mock.patch.object(subprocess, "Popen") as popen:
+            check_runnable([["python3", "-m", "pytest"]], self.bin)
         run.assert_not_called()
+        popen.assert_not_called()
 
-    def test_the_probe_runs_isolated_with_a_throwaway_home(self):
-        _program(self.bin, "python3", exit_code=0)
-        run = mock.Mock(return_value=subprocess.CompletedProcess([], 0))
-        check_runnable([["python3", "-m", "pytest"]], self.bin, run=run)
-        argv, kwargs = run.call_args.args[0], run.call_args.kwargs
-        self.assertEqual(argv[1:3], ["-I", "-c"])
-        self.assertEqual(kwargs["env"]["PATH"], self.bin)
-        self.assertNotEqual(kwargs["env"]["HOME"], str(Path.home()))
-        self.assertNotIn("PYTHONPATH", kwargs["env"])
-
-    def test_the_real_interpreter_probe_agrees_with_an_import(self):
-        directory = os.path.dirname(os.path.realpath(sys.executable))
-        name = os.path.basename(os.path.realpath(sys.executable))
-        if name not in ("python", "python3"):
-            os.symlink(os.path.realpath(sys.executable), os.path.join(self.bin, "python3"))
-            directory, name = self.bin, "python3"
-        has_pytest = subprocess.run(
-            [os.path.join(directory, name), "-I", "-c", "import pytest"],
-            capture_output=True, env={"PATH": directory, "HOME": self.bin}).returncode == 0
+    def test_relative_and_empty_path_entries_do_not_count(self):
+        # The verifier and the worker have different working directories.
+        os.makedirs(os.path.join(self.bin, "rel"))
+        _program(os.path.join(self.bin, "rel"), "pytest")
+        previous = os.getcwd()
+        os.chdir(self.bin)
         try:
-            check_runnable([[name, "-m", "pytest"]], directory)
-            refused = False
-        except VerifyPolicyError:
-            refused = True
-        self.assertEqual(refused, not has_pytest)
+            for path in ("rel", "", os.pathsep + "rel"):
+                with self.subTest(path=path):
+                    with self.assertRaisesRegex(VerifyPolicyError, "not on the worker's PATH"):
+                        check_runnable([["pytest"]], path)
+        finally:
+            os.chdir(previous)
 
 
 @unittest.skipIf(os.name != "posix", "the execution worker is POSIX only")

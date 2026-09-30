@@ -13,9 +13,8 @@ read-only subcommands, and no control characters anywhere in an argument.
 
 from __future__ import annotations
 
+import os
 import shutil
-import subprocess
-import tempfile
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Callable
 
@@ -36,12 +35,6 @@ MESSAGE_PYTHON = "Python verification is limited to python -m pytest or python -
 MESSAGE_GIT = "git verification is read-only"
 MESSAGE_CONTROL = "control character in verification argv"
 MESSAGE_NOT_ON_PATH = "verification program is not on the worker's PATH: {}"
-MESSAGE_MODULE = "verification module is not importable by the worker's {}: {}"
-MESSAGE_PROBE = "could not check the worker's {} for {}"
-
-#: How long one interpreter probe may take before the job is refused.
-PROBE_TIMEOUT_SECONDS = 30
-_PROBE_UNAVAILABLE = 3
 
 
 def _bare_name(program: str) -> bool:
@@ -79,43 +72,28 @@ def check_verify_argv(commands: object) -> list[list[str]]:
 
 
 def check_runnable(commands: list[list[str]], path: str, *,
-                   run: Callable[..., "subprocess.CompletedProcess[bytes]"] = subprocess.run,
                    which: Callable[..., str | None] = shutil.which) -> None:
-    """Refuse a job whose verification cannot start on this worker.
+    """Refuse a job whose verification program is not on this worker's PATH.
 
-    Called by the execution worker before it spends a provider run: 5 of the
-    first 39 live jobs generated for 6 to 23 minutes and then failed because
-    the worker's PATH had no ``python`` or ``pytest``, or its ``python3`` had
-    no pytest module. ``commands`` has already passed ``check_verify_argv``,
-    so every program is a bare allowlisted name and safe to name in a reason.
+    Called by the execution worker before it spends a provider run: live jobs
+    c0849b26, beffeccc and 7dcda0b7 generated for 12 to 14 minutes and then
+    failed because sandbox-exec could not find `pytest` or `python` on the
+    worker's PATH. ``commands`` has already passed ``check_verify_argv``, so
+    every program is a bare allowlisted name and safe to name in a reason.
 
-    Only what the verify step would do is checked, with the environment the
-    harness gives it: ``path`` is the worker's PATH, and the interpreter probe
-    runs isolated (``-I``) with a throwaway HOME, as the sandboxed verify step
-    has no user site-packages either. git is resolved by the harness itself,
-    not from PATH, and is not checked here. unittest ships with Python.
-    Anything the check cannot establish is a refusal, never a pass.
+    A lookup only; nothing is executed. Whether an interpreter can import
+    pytest is deliberately not probed here: running a PATH-selected program
+    outside the verification sandbox, with import rules that differ from the
+    sandboxed `python -m pytest` in the worktree, is less safe and less exact
+    than letting verification report it. Only absolute PATH entries count, so
+    the answer never depends on the worker's current directory. git is
+    resolved by the harness from a fixed location and is not checked here.
     """
+    absolute = os.pathsep.join(entry for entry in path.split(os.pathsep)
+                               if entry and os.path.isabs(entry))
     for command in commands:
         program = command[0]
         if program == "git":
             continue
-        resolved = which(program, path=path)
-        if not resolved:
+        if not which(program, path=absolute):
             raise VerifyPolicyError(MESSAGE_NOT_ON_PATH.format(program))
-        if program in PYTHON_PROGRAMS and command[1:3] == ["-m", "pytest"]:
-            code = ("import importlib.util, sys; "
-                    f"sys.exit(0 if importlib.util.find_spec('pytest') else {_PROBE_UNAVAILABLE})")
-            with tempfile.TemporaryDirectory(prefix="verify-probe-") as home:
-                try:
-                    result = run([resolved, "-I", "-c", code], env={
-                        "PATH": path, "HOME": home, "LANG": "C.UTF-8"},
-                        cwd=home, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL, timeout=PROBE_TIMEOUT_SECONDS,
-                        check=False)
-                except (OSError, subprocess.SubprocessError):
-                    raise VerifyPolicyError(MESSAGE_PROBE.format(program, "pytest")) from None
-            if result.returncode == _PROBE_UNAVAILABLE:
-                raise VerifyPolicyError(MESSAGE_MODULE.format(program, "pytest"))
-            if result.returncode != 0:
-                raise VerifyPolicyError(MESSAGE_PROBE.format(program, "pytest"))
