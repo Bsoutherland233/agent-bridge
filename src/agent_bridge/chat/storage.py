@@ -13,7 +13,8 @@ LABELS = ('public', 'synthetic', 'internal')
 class RoomStore:
     def __init__(self, path: Path, max_chars: int = 12000, participants=None):
         self.path, self.max_chars = Path(path), max_chars
-        self.participants = tuple(participants or PARTICIPANTS)
+        # Optional providers are added by the launcher only when explicitly enabled.
+        self.participants = tuple(participants or ('claude', 'codex'))
         if not self.participants or len(set(self.participants)) != len(self.participants):
             raise ValueError('At least one distinct participant is required')
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -185,7 +186,9 @@ class RoomStore:
                     raise ValueError('Invalid room preferences')
                 db.execute('INSERT INTO room_preferences VALUES(?,?,?) ON CONFLICT(room) DO UPDATE SET lead=excluded.lead,participants=excluded.participants', (room_id, lead, json.dumps(sorted(set(participants)))))
             row = db.execute('SELECT * FROM room_preferences WHERE room=?', (room_id,)).fetchone()
-            return {'lead':row['lead'], 'participants':json.loads(row['participants'])} if row else {'lead':self.participants[0], 'participants':list(self.participants)}
+            if row:
+                return {'lead': row['lead'], 'participants': [p for p in json.loads(row['participants']) if p in self.participants]}
+            return {'lead': self.participants[0], 'participants': [p for p in self.participants if p != 'hermes']}
     def rename_room(self, room_id, title):
         if not isinstance(title,str) or not title.strip() or len(title)>100:
             raise ValueError('Room title must contain 1-100 characters')

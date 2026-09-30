@@ -15,6 +15,18 @@ async function api(path, body) {
   const data = await response.json(); if(!response.ok) throw new Error(data.error || 'Request failed'); return data;
 }
 function error(e) { $('error').textContent=e.message; }
+function updateLeadOptions(current) {
+  const select = $('lead');
+  select.replaceChildren();
+  for (const p of participantStates) {
+    const option = node('option', p.id);
+    option.value = p.id;
+    option.disabled = p.state !== 'ready';
+    select.append(option);
+  }
+  if (current && participantStates.some(p => p.id === current)) select.value = current;
+  else if (participantStates.some(p => p.state === 'ready')) select.value = participantStates.find(p => p.state === 'ready').id;
+}
 async function loadRooms() {
   const rooms=await api('/api/rooms'); $('rooms').replaceChildren();
   if(!rooms.some(r=>r.id===roomId)){roomId=rooms.length?rooms[0].id:null;lastMessages='';preferencesRoom=null;}
@@ -26,13 +38,14 @@ async function refresh() {
   participantStates=status.participants;
   for(const p of status.participants) {
     const card=node('div',undefined,'participant '+p.state); card.append(node('strong',p.id),node('small',p.state.replaceAll('_',' '))); card.title=p.detail||'';
-    if(['claude','codex'].includes(p.id)) { const reset=node('button','Fresh consultation'); reset.title='Starts a new agent session with saved room history.'; reset.onclick=async()=>{try {await api('/api/rooms/'+roomId+'/reset',{target:p.id});$('error').textContent='Next request starts fresh with the saved room history.';}catch(e){error(e);}};card.append(reset); }
+    if(['claude','codex','hermes'].includes(p.id)) { const reset=node('button','Fresh consultation'); reset.title='Starts a new agent session with saved room history.'; reset.onclick=async()=>{try {await api('/api/rooms/'+roomId+'/reset',{target:p.id});$('error').textContent='Next request starts fresh with the saved room history.';}catch(e){error(e);}};card.append(reset); }
     $('participants').append(card);
     const label=node('label'); const input=node('input');input.type='checkbox';input.value=p.id;input.disabled=p.state!=='ready'; input.checked=selected.has(p.id);input.onchange=()=>{input.checked?selected.add(p.id):selected.delete(p.id);savePreferences();};label.append(input,document.createTextNode(' '+p.id));$('recipients').append(label);
   }
   if(!roomId){$('send').disabled=true;return;}
   const refreshingRoom=roomId;const snapshot=await api('/api/rooms/'+refreshingRoom);if(roomId!==refreshingRoom)return;
-  if(preferencesRoom!==roomId){preferencesRoom=roomId;$('lead').value=snapshot.preferences.lead;selected.clear();snapshot.preferences.participants.forEach(p=>selected.add(p));$('mode').value='chat';updateMode();for(const box of $('recipients').querySelectorAll('input'))box.checked=selected.has(box.value);}
+  updateLeadOptions(snapshot.preferences.lead);
+  if(preferencesRoom!==roomId){preferencesRoom=roomId;const ready=new Set(participantStates.filter(p=>p.state==='ready').map(p=>p.id));selected.clear();snapshot.preferences.participants.filter(p=>ready.has(p)).forEach(p=>selected.add(p));$('mode').value='chat';updateMode();for(const box of $('recipients').querySelectorAll('input'))box.checked=selected.has(box.value);}
   const busy=snapshot.jobs.some(j=>j.status==='queued'||j.status==='running');$('send').disabled=sending||busy;
   const encoded=JSON.stringify(snapshot.messages);
   if(encoded!==lastMessages){lastMessages=encoded;$('messages').replaceChildren();

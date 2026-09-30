@@ -62,6 +62,27 @@ codex:
 
     python -m agent_bridge.peer_mcp --caller codex
 
+Hermes is an optional third-party provider. To add it to the room, pass the
+explicit installed CLI path:
+
+    python start_chat.py --hermes-executable C:\\path\\to\\hermes.exe
+
+This adapter uses Hermes' `default` profile and its existing local login. It
+does not create a new profile, change the login, or alter Hermes' retention
+settings. Hermes may retain prompts and replies under the terms of that
+provider's default profile; review those terms before enabling it. Peer-round
+calls receive only the selected context and use `--ignore-rules`; ordinary
+room chat and discussion calls receive the room transcript and do not use that
+flag. The adapter exposes clarification only, without filesystem or messaging
+tools. The room keeps a temporary job directory until its reply is read and
+deletes unread job directories after 24 hours.
+
+Readiness is derived from the supplied executable's expected Hermes source
+layout and the private state directory; there is no hand-written
+`verification.json` gate. The first real call still depends on the default
+profile being signed in. Hermes is a third-party provider, so the offline test
+suite never makes a live provider call.
+
 If the room uses a custom state directory, pass the same directory with
 --state-dir. Do not expose the stdio service publicly.
 

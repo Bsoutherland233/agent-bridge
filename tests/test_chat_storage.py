@@ -51,5 +51,10 @@ class StorageTests(unittest.TestCase):
         self.assertEqual([m['text'] for m in snapshot['messages']], ['Just a note'])
         self.assertEqual(snapshot['jobs'], [])
 
+    def test_new_room_does_not_preselect_optional_hermes(self):
+        store = RoomStore(Path(self.temp.name) / 'hermes.sqlite', participants=('claude', 'codex', 'hermes'))
+        room = store.create_room('Optional Hermes')['id']
+        self.assertEqual(store.preferences(room), {'lead': 'claude', 'participants': ['claude', 'codex']})
+
 if __name__ == '__main__':
     unittest.main()
