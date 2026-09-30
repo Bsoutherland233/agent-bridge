@@ -829,10 +829,12 @@ class GenerationFenceTests(unittest.TestCase):
         for target in ('(subpath "/j/gen")', '(subpath "/j/tmp")',
                        '(subpath "/Users/example/.agent-bridge/claude-home")',
                        '(literal "/Users/example/.agent-bridge/claude-home.lock")',
-                       '(subpath "/Users/example/.local/state/claude")',
+                       '(subpath "/Users/example/.local/state/claude/locks")',
                        '(subpath "/private/tmp/cc-socks")'):
             self.assertIn(target, profile)
         self.assertIn("login\\.keychain", profile)
+        self.assertIn('(process-path "/usr/bin/security")', profile)
+        self.assertNotIn('(subpath "/Users/example/Library', profile)
         self.assertNotIn('(subpath "/Users/example")', profile)
 
     def test_a_path_that_would_break_the_profile_is_refused(self):
@@ -859,6 +861,41 @@ class GenerationFenceTests(unittest.TestCase):
             self.assertTrue((gen / "ok").exists())
             self.assertNotEqual(blocked.returncode, 0)
             self.assertFalse((outside / "no").exists())
+
+    @unittest.skipUnless(os.path.isfile(hostenv.SANDBOX_EXEC), "the fence is sandbox-exec")
+    def test_symlinks_are_judged_by_target_and_hard_links_are_refused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            job, gen, outside = root / "job", root / "gen", root / "outside"
+            for d in (job, gen, outside):
+                d.mkdir()
+            target = outside / "target"
+            target.write_text("orig")
+            (gen / "sym").symlink_to(target)
+            command, env, _ = claude_task._fenced_generation(
+                ["/bin/sh", "-c", f"echo x > {gen / 'sym'}"], job, gen, None,
+                {"HOME": str(root), "PATH": "/usr/bin:/bin"}, hostenv.MACOS_SANDBOX_EXEC)
+            subprocess.run(command, env=env, capture_output=True)
+            self.assertEqual(target.read_text(), "orig")
+            os.link(target, gen / "hard")
+            with self.assertRaisesRegex(TaskError, "hard-linked"):
+                claude_task._fenced_generation(["x"], root / "job2", gen, None,
+                                               {"HOME": str(root)}, hostenv.MACOS_SANDBOX_EXEC)
+
+    @unittest.skipUnless(os.path.isfile(hostenv.SANDBOX_EXEC), "the fence is sandbox-exec")
+    def test_only_the_security_program_may_write_the_keychain_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            keychains = root / "Library" / "Keychains"
+            keychains.mkdir(parents=True)
+            job, gen = root / "job", root / "gen"
+            job.mkdir(); gen.mkdir()
+            command, env, _ = claude_task._fenced_generation(
+                ["/usr/bin/touch", str(keychains / "login.keychain-db")], job, gen, None,
+                {"HOME": str(root), "PATH": "/usr/bin:/bin"}, hostenv.MACOS_SANDBOX_EXEC)
+            result = subprocess.run(command, env=env, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((keychains / "login.keychain-db").exists())
 
     def test_a_backend_that_cannot_fence_writes_says_so(self):
         command, env, fence = claude_task._fenced_generation(

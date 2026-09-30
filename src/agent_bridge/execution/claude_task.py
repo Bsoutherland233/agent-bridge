@@ -515,8 +515,10 @@ def _generation_fence(tree:Path,tmp:Path,config_dir:Path|None,home:Path)->str:
     Network and reads stay open: generation has to reach Anthropic and read
     the worktree. Writes are limited to the worktree, a private temp directory,
     the lane's own config store (and the CLI's lock beside it), the CLI's
-    version lock under ~/.local/state/claude, its socket directory, and the
-    login keychain the CLI's `security` child updates on a token refresh. The
+    version locks under ~/.local/state/claude/locks, its socket directory, and
+    the login keychain, for the `security` child only, which updates it on a
+    token refresh. The worktree's own `.git` file is writable here; run_task
+    refuses the job if generation changed it, before any other git command. The
     list was measured, not guessed: one synthetic haiku run under a
     report-every-write profile (2026-09-30) recorded exactly these targets.
     The fence exists so that giving each job a private clone does not also
@@ -534,15 +536,32 @@ def _generation_fence(tree:Path,tmp:Path,config_dir:Path|None,home:Path)->str:
         for p in dict.fromkeys((config_dir,config_dir.resolve())):
             allowed.append(f'(subpath "{literal(p)}")')
             allowed.append(f'(literal "{literal(p)}.lock")')
-    state=home/".local"/"state"/"claude"
+    state=home/".local"/"state"/"claude"/"locks"
     allowed.append(f'(subpath "{literal(state)}")')
     allowed.append('(subpath "/private/tmp/cc-socks")')
-    keychain=re.escape(literal(home/"Library"/"Keychains"/"login.keychain-db"))
-    allowed.append(f'(regex #"^{keychain}(\\.sb-[^/]+)?$")')
     for device in ("/dev/null","/dev/tty","/dev/dtracehelper"):
         allowed.append(f'(literal "{device}")')
+    # The login keychain, for the CLI's `security` child only (a token refresh
+    # rewrites it). A path rule alone would let the Write tool replace the
+    # keychain database itself; tying it to the executable's path does not.
+    keychain=re.escape(literal(home/"Library"/"Keychains"/"login.keychain-db"))
     return ("(version 1)\n(allow default)\n(deny file-write*)\n"
-            f"(allow file-write* {' '.join(allowed)})\n")
+            f"(allow file-write* {' '.join(allowed)})\n"
+            f'(allow file-write* (require-all (regex #"^{keychain}(\\.sb-[^/]+)?$") '
+            f'(process-path "{SECURITY_BIN}")))\n')
+
+SECURITY_BIN="/usr/bin/security"
+
+def _refuse_hard_links(tree:Path)->None:
+    """The fence judges a write by path. A hard link inside the worktree is
+    another path to a file outside it, so none may exist when generation
+    starts (Claude's tools cannot create one; a checkout never should)."""
+    for folder,dirs,files in os.walk(tree):
+        dirs[:]=[d for d in dirs if d!=".git"]
+        for name in files:
+            info=os.lstat(os.path.join(folder,name))
+            if stat.S_ISREG(info.st_mode) and info.st_nlink>1:
+                raise TaskError("the generation worktree contains a hard-linked file")
 
 def _fenced_generation(command:list[str],job:Path,gen:Path,config_dir:Path|None,env:dict[str,str],
                        backend_name:str|None):
@@ -556,6 +575,7 @@ def _fenced_generation(command:list[str],job:Path,gen:Path,config_dir:Path|None,
     can mistake an unfenced run for a fenced one."""
     if backend_name!=hostenv.MACOS_SANDBOX_EXEC:
         return command,env,None
+    _refuse_hard_links(gen)
     tmp=job/"generation-tmp"; tmp.mkdir(mode=0o700)
     profile=job/"generation.sb"
     profile.write_text(_generation_fence(gen,tmp,config_dir,Path(env.get("HOME") or Path.home())))
