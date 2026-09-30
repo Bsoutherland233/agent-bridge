@@ -95,5 +95,7 @@ def check_runnable(commands: list[list[str]], path: str, *,
         program = command[0]
         if program == "git":
             continue
-        if not which(program, path=absolute):
+        # An empty search path is not "nowhere" to which(): it searches the
+        # current directory. No absolute entry means nothing can be found.
+        if not absolute or not which(program, path=absolute):
             raise VerifyPolicyError(MESSAGE_NOT_ON_PATH.format(program))

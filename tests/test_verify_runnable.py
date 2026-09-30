@@ -63,6 +63,18 @@ class CheckRunnableTests(unittest.TestCase):
         run.assert_not_called()
         popen.assert_not_called()
 
+    def test_a_path_with_no_absolute_entry_never_searches_the_current_directory(self):
+        _program(self.bin, "pytest")
+        previous = os.getcwd()
+        os.chdir(self.bin)
+        try:
+            for path in ("", "rel", "." + os.pathsep + "rel"):
+                with self.subTest(path=path):
+                    with self.assertRaisesRegex(VerifyPolicyError, "not on the worker's PATH"):
+                        check_runnable([["pytest"]], path)
+        finally:
+            os.chdir(previous)
+
     def test_relative_and_empty_path_entries_do_not_count(self):
         # The verifier and the worker have different working directories.
         os.makedirs(os.path.join(self.bin, "rel"))
