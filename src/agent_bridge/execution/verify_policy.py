@@ -13,7 +13,10 @@ read-only subcommands, and no control characters anywhere in an argument.
 
 from __future__ import annotations
 
+import os
+import shutil
 from pathlib import PurePosixPath, PureWindowsPath
+from typing import Callable
 
 
 class VerifyPolicyError(ValueError):
@@ -31,6 +34,7 @@ MESSAGE_PROGRAM = "verification executable is not allowlisted"
 MESSAGE_PYTHON = "Python verification is limited to python -m pytest or python -m unittest"
 MESSAGE_GIT = "git verification is read-only"
 MESSAGE_CONTROL = "control character in verification argv"
+MESSAGE_NOT_ON_PATH = "verification program is not on the worker's PATH: {}"
 
 
 def _bare_name(program: str) -> bool:
@@ -65,3 +69,33 @@ def check_verify_argv(commands: object) -> list[list[str]]:
         if any(any(char in part for char in ("\0", "\n", "\r")) for part in command):
             raise VerifyPolicyError(MESSAGE_CONTROL)
     return [list(command) for command in commands]
+
+
+def check_runnable(commands: list[list[str]], path: str, *,
+                   which: Callable[..., str | None] = shutil.which) -> None:
+    """Refuse a job whose verification program is not on this worker's PATH.
+
+    Called by the execution worker before it spends a provider run: live jobs
+    c0849b26, beffeccc and 7dcda0b7 generated for 12 to 14 minutes and then
+    failed because sandbox-exec could not find `pytest` or `python` on the
+    worker's PATH. ``commands`` has already passed ``check_verify_argv``, so
+    every program is a bare allowlisted name and safe to name in a reason.
+
+    A lookup only; nothing is executed. Whether an interpreter can import
+    pytest is deliberately not probed here: running a PATH-selected program
+    outside the verification sandbox, with import rules that differ from the
+    sandboxed `python -m pytest` in the worktree, is less safe and less exact
+    than letting verification report it. Only absolute PATH entries count, so
+    the answer never depends on the worker's current directory. git is
+    resolved by the harness from a fixed location and is not checked here.
+    """
+    absolute = os.pathsep.join(entry for entry in path.split(os.pathsep)
+                               if entry and os.path.isabs(entry))
+    for command in commands:
+        program = command[0]
+        if program == "git":
+            continue
+        # An empty search path is not "nowhere" to which(): it searches the
+        # current directory. No absolute entry means nothing can be found.
+        if not absolute or not which(program, path=absolute):
+            raise VerifyPolicyError(MESSAGE_NOT_ON_PATH.format(program))
