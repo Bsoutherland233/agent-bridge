@@ -1,6 +1,9 @@
 from pathlib import Path
 import os
 import json
+import io
+import importlib.util
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -125,3 +128,16 @@ class GrokTests(StorageTests):
         (root / 'bot-manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
         self.assertEqual(adapter.status()['state'], 'ready')
         self.assertIn('operator-declared', adapter.status()['detail'])
+
+    def test_helper_reads_reply_from_standard_input_and_has_no_file_option(self):
+        script = Path(__file__).resolve().parents[1] / 'grok_room.py'
+        spec = importlib.util.spec_from_file_location('grok_room', script)
+        grok_room = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(grok_room)
+        root = Path(self.temp.name) / 'queue'
+        with patch.object(grok_room, 'respond') as respond, patch.object(sys, 'argv', ['grok_room.py', 'reply', '00000000-0000-0000-0000-000000000000', '--queue-dir', str(root)]), patch.object(sys, 'stdin', io.StringIO('reply text')):
+            grok_room.main()
+        respond.assert_called_once_with(root.resolve(), '00000000-0000-0000-0000-000000000000', 'reply text')
+        with self.assertRaisesRegex(SystemExit, '2'):
+            with patch.object(sys, 'argv', ['grok_room.py', 'reply', '00000000-0000-0000-0000-000000000000', '--file', 'reply.txt']):
+                grok_room.main()

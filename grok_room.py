@@ -23,26 +23,17 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     nxt = sub.add_parser('next')
     nxt.add_argument('--wait', type=int, default=45, help='Seconds to wait (0 = check once)')
-    nxt.add_argument('--queue-dir', '--state-dir', dest='state_dir', type=Path, default=Path.home() / '.agent-bridge' / 'chat' / 'grok')
+    nxt.add_argument('--queue-dir', '--state-dir', dest='state_dir', type=Path, default=Path.home() / '.agent-bridge' / 'grok')
     reply = sub.add_parser('reply')
     reply.add_argument('job_id')
-    reply.add_argument('--file', type=Path, help='Read UTF-8 reply text from reply-<job-id>.txt inside the private queue directory')
-    reply.add_argument('--queue-dir', '--state-dir', dest='state_dir', type=Path, default=Path.home() / '.agent-bridge' / 'chat' / 'grok')
+    reply.add_argument('--queue-dir', '--state-dir', dest='state_dir', type=Path, default=Path.home() / '.agent-bridge' / 'grok')
     args = parser.parse_args()
     root = args.state_dir.resolve()
     if args.command == 'next':
         print(json.dumps(receive(root, args.wait) or {'status': 'idle', 'note': 'No addressed request yet'}, ensure_ascii=False))
     else:
-        if args.file is not None:
-            source = args.file.resolve()
-            if source.parent != root or source.name != f'reply-{args.job_id}.txt' or not source.is_file():
-                raise SystemExit('--file must be reply-<job-id>.txt directly inside --queue-dir')
-            text = source.read_text(encoding='utf-8')[:100001]
-        else:
-            text = sys.stdin.read(100002)
+        text = sys.stdin.read(100002)
         respond(root, args.job_id, text)
-        if args.file is not None:
-            source.unlink(missing_ok=True)
         print(json.dumps({'status': 'reply_saved'}))
 
 
