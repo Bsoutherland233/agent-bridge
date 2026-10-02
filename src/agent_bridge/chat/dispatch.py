@@ -24,6 +24,7 @@ class Dispatcher:
     def __init__(self, store, adapters):
         self.store, self.adapters = store, adapters
         self.closed = threading.Event()
+        self._provider_jobs, self._provider_jobs_lock = {}, threading.Lock()
 
     def run_once(self) -> bool:
         job = self.store.claim_next()
@@ -55,6 +56,8 @@ class Dispatcher:
             result = (adapter.continue_(session['conversation'], prompt, classification) if session else adapter.start(prompt, classification))
             if not result.get('ok'):
                 raise ValueError(result.get('error_hint', 'Bridge refused the request'))
+            with self._provider_jobs_lock:
+                self._provider_jobs[job['id']] = (adapter, result['job_id'])
             deadline = time.monotonic() + getattr(adapter, 'timeout', 480)
             while self.store.is_running(job['id']) and not self.closed.is_set():
                 poll = adapter.poll(result['job_id'])
@@ -76,9 +79,11 @@ class Dispatcher:
             message = getattr(exc, 'category', None)
             self.store.fail(job, str(message.value if message else exc)[:500])
         finally:
-            if result and hasattr(adapter, 'cancel') and (self.closed.is_set() or not self.store.is_running(job['id'])):
+            with self._provider_jobs_lock:
+                active_provider_job = self._provider_jobs.pop(job['id'], None)
+            if result and active_provider_job and hasattr(adapter, 'cancel') and (self.closed.is_set() or not self.store.is_running(job['id'])):
                 try:
-                    adapter.cancel(result['job_id'])
+                    adapter.cancel(active_provider_job[1])
                 except Exception:
                     # Cleanup cannot terminate the worker and strand other agents.
                     # The room job is already terminal; provider deadlines still apply.
@@ -94,10 +99,11 @@ class Dispatcher:
         for job in jobs:
             if job['status'] not in ('queued', 'running'):
                 continue
-            adapter = self.adapters.get(job['target'])
-            if adapter is not None and hasattr(adapter, 'cancel'):
+            with self._provider_jobs_lock:
+                provider_job = self._provider_jobs.pop(job['id'], None)
+            if provider_job is not None and hasattr(provider_job[0], 'cancel'):
                 try:
-                    adapter.cancel(job['id'])
+                    provider_job[0].cancel(provider_job[1])
                 except Exception:
                     # Room deletion must not fail because a provider cleanup is unavailable.
                     pass

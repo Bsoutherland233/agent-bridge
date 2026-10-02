@@ -38,6 +38,7 @@ class RoomManagementTests(StorageTests):
         job = store.claim_next()
         dispatcher = Dispatcher(store, {'grok': peer})
         dispatcher.cancel_room(room)
-        self.assertEqual(peer.cancelled, [job['id']])
+        self.assertEqual(peer.cancelled, [])
+        self.assertEqual(store.snapshot(room)['jobs'][0]['status'], 'cancelled')
         store.delete_room(room)
         self.assertNotIn(room, [entry['id'] for entry in store.rooms()])
