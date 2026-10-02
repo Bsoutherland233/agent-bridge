@@ -248,4 +248,3 @@ Expected: no whitespace errors and every required check passing.
 - [ ] **Step 4: Update the PR description only with factual Bot details supplied by Scott**
 
 Add the exact approved product name, version, tools, and launch-time limitation. Keep the PR a draft until that information and Scott's final review are complete.
-
