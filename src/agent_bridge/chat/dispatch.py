@@ -88,6 +88,21 @@ class Dispatcher:
     def stop(self, room_id: str) -> dict:
         return self.store.stop(room_id)
 
+    def cancel_room(self, room_id: str) -> dict:
+        """Cancel adapter work while its room jobs are still addressable."""
+        jobs = self.store.snapshot(room_id)['jobs']
+        for job in jobs:
+            if job['status'] not in ('queued', 'running'):
+                continue
+            adapter = self.adapters.get(job['target'])
+            if adapter is not None and hasattr(adapter, 'cancel'):
+                try:
+                    adapter.cancel(job['id'])
+                except Exception:
+                    # Room deletion must not fail because a provider cleanup is unavailable.
+                    pass
+        return self.store.stop(room_id)
+
     def loop(self):
         while not self.closed.is_set():
             try:
