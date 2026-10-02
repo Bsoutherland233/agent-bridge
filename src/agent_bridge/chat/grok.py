@@ -129,26 +129,29 @@ class GrokAdapter:
         return {'ok': True, 'job_id': job_id, 'conversation_id': conversation_id}
 
     def poll(self, job_id):
-        record = _load_record(job_path(self.root, job_id))
-        if record is None:
-            raise ValueError('Unknown request')
-        status = record['status']
-        if status in ('queued', 'running') and time.time() >= record['expires']:
-            status = 'timed_out'
-            record['status'] = status
-            store.atomic_write_json(str(job_path(self.root, job_id)), record)
-        return {'ok': True, 'status': status}
+        with store.file_lock(str(self.root / 'queue.lock')):
+            path = job_path(self.root, job_id)
+            record = _load_record(path)
+            if record is None:
+                raise ValueError('Unknown request')
+            status = record['status']
+            if status in ('queued', 'running') and time.time() >= record['expires']:
+                status = 'timed_out'
+                record['status'] = status
+                store.atomic_write_json(str(path), record)
+            return {'ok': True, 'status': status}
 
     def read(self, job_id):
-        path = job_path(self.root, job_id)
-        record = _load_record(path)
-        if record is None:
-            raise ValueError('Unknown request')
-        if record['status'] != 'complete':
-            return {'ok': False, 'error_hint': 'Grok did not respond in time. Reconnect the Bot and request a new reply.'}
-        result = {'ok': True, 'peer_response': record['text']}
-        path.unlink(missing_ok=True)
-        return result
+        with store.file_lock(str(self.root / 'queue.lock')):
+            path = job_path(self.root, job_id)
+            record = _load_record(path)
+            if record is None:
+                raise ValueError('Unknown request')
+            if record['status'] != 'complete':
+                return {'ok': False, 'error_hint': 'Grok did not respond in time. Reconnect the Bot and request a new reply.'}
+            result = {'ok': True, 'peer_response': record['text']}
+            path.unlink(missing_ok=True)
+            return result
 
     def cancel(self, job_id):
         with store.file_lock(str(self.root / 'queue.lock')):

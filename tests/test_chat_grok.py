@@ -64,6 +64,18 @@ class GrokTests(StorageTests):
         with self.assertRaises(ValueError):
             respond(adapter.root, job['job_id'], 'duplicate')
 
+    def test_poll_and_read_hold_the_queue_lock(self):
+        from agent_bridge import store
+        adapter = self.adapter('locked-read')
+        receive(adapter.root, wait=0)
+        job = adapter.start('A synthetic room prompt', 'synthetic')
+        receive(adapter.root, wait=0)
+        respond(adapter.root, job['job_id'], 'Reply from existing Grok Bot')
+        with patch.object(store, 'file_lock', wraps=store.file_lock) as file_lock:
+            self.assertEqual(adapter.poll(job['job_id'])['status'], 'complete')
+            self.assertEqual(adapter.read(job['job_id'])['peer_response'], 'Reply from existing Grok Bot')
+        self.assertEqual(file_lock.call_count, 2)
+
     def test_expired_and_traversal_jobs_are_refused(self):
         adapter = self.adapter()
         with self.assertRaises(ValueError):
