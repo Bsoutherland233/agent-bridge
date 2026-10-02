@@ -70,9 +70,11 @@ def build_app(root: Path, allow_client: bool = False, hermes_executable: Path | 
     room_store.recover_interrupted()
     dispatcher = Dispatcher(room_store, adapters)
     token = secrets.token_urlsafe(32)
-    round_adapters = {p: adapters[p] for p in participants}
+    # Grok communicates only through its local queue helper; it has no MCP peer client.
+    peer_participants = [p for p in participants if p != 'grok']
+    round_adapters = {p: adapters[p] for p in peer_participants}
     rounds = PeerRounds(room_store, round_adapters, policy)
-    rounds_token = {caller: secrets.token_urlsafe(32) for caller in participants}
+    rounds_token = {caller: secrets.token_urlsafe(32) for caller in peer_participants}
     server = create_server(room_store, dispatcher, token, policy=policy, rounds=rounds, rounds_token=rounds_token)
     server.peer_rounds, server.rounds_token = rounds, rounds_token
     return server, room_store, dispatcher, token
